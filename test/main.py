@@ -41,7 +41,7 @@ transitions = [
     {"trigger": "create_new_arrow", "source": "touched_20", "dest": "created_new_arrow"},
     {"trigger": "touch_37", "source": ["created_new_arrow", "infibos_has_determined_neck"], "dest": "infibos"},
     {"trigger": "neck_determine", "source": "infibos", "dest": "infibos_has_determined_neck"},
-    {"trigger": "build_position", "source": "infibos_has_determined_neck", "dest": "has_position"},
+    {"trigger": "build_position", "source": ["infibos","infibos_has_determined_neck"], "dest": "has_position"},
     {"trigger": "close", "source": "has_position", "dest": "closed"}
 ]
 
@@ -149,19 +149,44 @@ class MyModel(object):
 
 #--------------------ここから------------------------------
     
+    # def handle_infibos(self, df, sml_df):
+    #     self.price_in_range_while_adjustment(df)
+        
+    #     if self.potential_neck:
+    #         if self.check_potential_entry() is True:
+    #             self.build_position()
+    #         elif self.check_potential_entry() is False:
+    #             self.potential_neck = []
+    #     elif len(self.determined_neck) > 0:
+    #         self.neck_determine()
+
     def handle_infibos(self, df, sml_df):
-        self.price_in_range_while_adjustment(df)
-        if self.name == "Session_2":
-                    print(f"ここでセッション２テスト！セッション名:{self.name},トレンド：{self.up_trend},開始：{self.start_pivot}、スモール：{self.sml_pivot_data}")
-                    print("ゴールデンクロス後のぴぼと",self.sml_pivots_after_goldencross)
-                    print(f"{self.name}: トレンド：{self.up_trend},ゴールデンクロス{self.sml_pivots_after_goldencross},ポテンシャル{self.potential_neck},デターミンド{self.determined_neck}、カレント{current_df}ステートタイム{self.state_times}")
-        if len(self.determined_neck) > 0:
+        if self.potential_neck:
+            entry_result = self.potential_entry(df, self.potential_neck)
+            if entry_result is True:
+                self.build_position()
+            elif entry_result is False:
+                self.potential_neck = []
+        elif len(self.determined_neck) > 0:
             self.neck_determine()
-    
-    
+
+        self.price_in_range_while_adjustment(df)
+        
+
+    #if self.name == "Session_2":
+    #     print(f"ここでセッション２テスト！セッション名:{self.name},トレンド：{self.up_trend},開始：{self.start_pivot}、スモール：{self.sml_pivot_data}")
+    #     print("ゴールデンクロス後のぴぼと",self.sml_pivots_after_goldencross)
+    #     print(f"{self.name}: トレンド：{self.up_trend},ゴールデンクロス{self.sml_pivots_after_goldencross},ポテンシャル{self.potential_neck},デターミンド{self.determined_neck}、カレント{current_df}ステートタイム{self.state_times}")
+
 
     def handle_infibos_has_determined_neck(self, df, sml_df):
-        self.price_in_range_while_adjustment(df)
+
+        if self.potential_neck:
+            entry_result = self.potential_entry(df, self.potential_neck)
+            if entry_result is True:
+                self.build_position()
+            elif entry_result is False:
+                self.potential_neck = []
         
         if "has_position" not in self.state:
             self.highlow_since_new_arrow = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0])
@@ -208,6 +233,8 @@ class MyModel(object):
                         self.determined_neck.remove(neckline)
                         if not self.determined_neck:
                             self.touch_37()
+
+        self.price_in_range_while_adjustment(df)
 
         
     
@@ -405,6 +432,7 @@ class MyModel(object):
                         if watch_price_in_range(fibo32_of_ptl_neck[0],fibo32_of_ptl_neck[1],sml_pvts[i+1]):
                             
                             self.determined_neck.append(sml_pvts[i])
+                            self.organize_determined_neck()
                     else:
                         pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
                         fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,-0.32,0.32,None,None)
@@ -418,6 +446,7 @@ class MyModel(object):
                         fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,None,None,-0.32,0.32)
                         if watch_price_in_range(fibo32_of_ptl_neck[2],fibo32_of_ptl_neck[3],sml_pvts[i+1]):
                             self.determined_neck.append(sml_pvts[i])
+                            self.organize_determined_neck()
                     else:
                         pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
                         fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,None,None,-0.32,0.32)
@@ -439,19 +468,70 @@ class MyModel(object):
                 
                 fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,-0.32,0.32,None,None)
                 if watch_price_in_range(fibo32_of_ptl_neck[0],fibo32_of_ptl_neck[1],sml_pvts[-1][1]):
-                    self.determined_neck.append(self.potential_neck.copy())
+                    self.determined_neck.append(self.potential_neck[-1])
+                    print(f"ここだよおぽてね{self.potential_neck}")
                     self.potential_neck.clear()
+                    print(f"ここだよおぽてね{self.potential_neck}")
+                    self.organize_determined_neck()
                     
 
             elif self.up_trend is False:
                 fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,None,None,-0.32,0.32)
                 if watch_price_in_range(fibo32_of_ptl_neck[2],fibo32_of_ptl_neck[3],sml_pvts[-1][1]):
-                    self.determined_neck.append(self.potential_neck.copy())
+                    self.determined_neck.append(self.potential_neck[-1])
                     self.potential_neck.clear()
+                    print("ここだよおおおおおおおおお")
+                    self.organize_determined_neck()
+
+    def potential_entry(self, df, neckline):
+    # up_trendがTrueの場合
+        if self.up_trend is True:
+            if df.iloc[-1]["high"] > neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:]):
+                self.stop_loss = self.highlow_since_new_arrow[1] - 0.006
+                pivots_data_to_get_take_profit = self.start_pivot, self.new_arrow_pivot
+                highlow = detect_extension_reversal(pivots_data_to_get_take_profit, higher1_percent=0.32)
+                self.take_profit = highlow[2]
+                self.entry_line = neckline[-1][1] + 0.002
+                self.entry_pivot = df.iloc[-1]
+                self.point_to_stoploss = abs(self.entry_line - self.stop_loss)
+                print(f"エントリー記録：：：　アプトれ{self.up_trend}, {self.name}、ネック：{neckline}、エントリーライン：{self.entry_line}、エントリーピボット：{self.entry_pivot}, テイクプロフィット：{self.take_profit}")
+                return True
+            elif df.iloc[-1]["high"] > neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:]) is False:
+                return False
+
+        # up_trendがFalseの場合
+        if self.up_trend is False:
+            if df.iloc[-1]["low"] < neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:]) is False:
+                self.stop_loss = self.highlow_since_new_arrow[0] + 0.006
+                pivots_data_to_get_take_profit = self.start_pivot, self.new_arrow_pivot
+                highlow = detect_extension_reversal(pivots_data_to_get_take_profit, lower1_percent=-0.32)
+                self.take_profit = highlow[0]
+                self.entry_line = neckline[-1][1] - 0.002
+                self.entry_pivot = df.iloc[-1]
+                self.point_to_stoploss = abs(self.entry_line - self.stop_loss)
+                self.point_to_take_profit = abs(self.entry_line - self.take_profit)
+                print(f"エントリー記録：：：　アプトれ{self.up_trend}, {self.name}、ネック：{neckline}、エントリーライン：{self.entry_line}、エントリーピボット：{self.entry_pivot}, テイクプロフィット：{self.take_profit}")
+                return True
+            elif df.iloc[-1]["low"] < neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:]) is False:
+                return False
+
+        # 条件に該当しない場合は明示的にFalseを返すなど
+        return None
+
+    def organize_determined_neck(self):
+        result = []
+        print(f"開始:{self.pivot_data},アプトレ{self.up_trend},ポテンシャル{self.determined_neck},デタマインド{self.determined_neck}")
+        for item in self.determined_neck:
+        # item[1] が数値であると仮定
+            while result and item[1] > result[-1][1]:
+                result.pop()
+            result.append(item)
+        self.determined_neck = result
+
 
     def price_in_range_while_adjustment(self,df):
         if self.up_trend is True:
-            
+
             high = self.new_arrow_pivot[1]
             low = self.base_fibo70
             judged_price = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0])
@@ -467,7 +547,6 @@ class MyModel(object):
             if high < judged_price[0] or low > judged_price[1]:
                 self.destroy_reqest = True
         
-
 
 
 #############################################
@@ -542,8 +621,7 @@ class WaveManager(object):
 
                 if session.potential_neck:
                     session.check_potential_to_determine_neck()
-
-                if not session.potential_neck and session.up_trend is True and new_sml_pivot_data[2] == "high":
+                elif not session.potential_neck and session.up_trend is True and new_sml_pivot_data[2] == "high":
                     session.potential_neck.append(new_sml_pivot_data)
                 elif not session.potential_neck and session.up_trend is False and new_sml_pivot_data[2] == "low":
                     session.potential_neck.append(new_sml_pivot_data)
@@ -1098,7 +1176,7 @@ def process_data(symbol="USDJPY"):
             consecutive_bars=1,
             name="SML_SMA", 
             arrow_spacing=1
-        )   
+        )    
         if sml_new_pivot is not None and sml_new_pivot != sml_last_pivot_data:
             sml_last_pivot_data = sml_new_pivot
             sml_pivot_data.append(sml_new_pivot)
