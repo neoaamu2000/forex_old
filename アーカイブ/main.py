@@ -172,13 +172,11 @@ class MyModel(object):
             if self.up_trend is True:
                 for neckline in self.determined_neck[:]:
                     if self.state != 'infibos_has_determined_neck':
-                        break  # 状態が変わっていたら処理中断
-
-                    if df.iloc[-1]["high"] > neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:]):
-                        
-                        self.stop_loss = self.highlow_since_new_arrow[1] - 0.006 #推進波終了以降の最も調整の深い部分から0.006円低い価格を取得
-                        pivots_data_to_get_take_profit = self.start_pivot, self.new_arrow_pivot
-                        highlow = detect_extension_reversal(pivots_data_to_get_take_profit, higher1_percent=0.32)
+                        break
+                    if df.iloc[-1]["high"] > neckline[1] and self.check_no_SMA(df.iloc[-1050:], neckline[1]):
+                        self.stop_loss = self.highlow_since_new_arrow[1] - 0.006
+                        pivots_data = (self.start_pivot, self.new_arrow_pivot)
+                        highlow = detect_extension_reversal(pivots_data, higher1_percent=0.32)
                         self.take_profit = highlow[2]
                         self.entry_line = neckline[-1][1] + 0.002
                         self.entry_pivot = df.iloc[-1]
@@ -194,10 +192,12 @@ class MyModel(object):
 
             if self.up_trend is False:
                 for neckline in self.determined_neck[:]:
-                    if df.iloc[-1]["low"] < neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:]) is False:
-                        self.stop_loss = self.highlow_since_new_arrow[0] + 0.006 #推進波終了以降の最も調整の深い部分から0.006円高い価格を取得
-                        pivots_data_to_get_take_profit = self.start_pivot, self.new_arrow_pivot
-                        highlow = detect_extension_reversal(pivots_data_to_get_take_profit, lower1_percent= -0.32)
+                    if self.state != 'infibos_has_determined_neck':
+                        break
+                    if df.iloc[-1]["low"] < neckline[1] and not self.check_no_SMA(df.iloc[-1050:], neckline[1]):
+                        self.stop_loss = self.highlow_since_new_arrow[0] + 0.006
+                        pivots_data = (self.start_pivot, self.new_arrow_pivot)
+                        highlow = detect_extension_reversal(pivots_data, lower1_percent=-0.32)
                         self.take_profit = highlow[0]
                         self.entry_line = neckline[-1][1] - 0.002
                         self.entry_pivot = df.iloc[-1]
@@ -438,17 +438,53 @@ class MyModel(object):
                 if watch_price_in_range(fibo32_of_ptl_neck[0],fibo32_of_ptl_neck[1],sml_pvts[-1][1]):
                     self.determined_neck.append(self.potential_neck.copy())
                     self.potential_neck.clear()
-                    
-
-            elif self.up_trend is False:
-                fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,None,None,-0.32,0.32)
-                if watch_price_in_range(fibo32_of_ptl_neck[2],fibo32_of_ptl_neck[3],sml_pvts[-1][1]):
-                    self.determined_neck.append(self.potential_neck.copy())
+                    self.organize_determined_neck()
+            else:
+                fibo32 = detect_extension_reversal(pvts, None, None, -0.32, 0.32)
+                if watch_price_in_range(fibo32[2], fibo32[3], sml_pvts[-1][1]):
+                    self.determined_neck.append(self.potential_neck[-1])
                     self.potential_neck.clear()
+                    self.organize_determined_neck()
 
-    def price_in_range_while_adjustment(self,df):
-        if self.up_trend is True:
-            
+    def potential_entry(self, df, neckline):
+        if self.up_trend:
+            if df.iloc[-1]["high"] > neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:], neckline[-1][1]):
+                self.stop_loss = self.highlow_since_new_arrow[1] - 0.006
+                pivots_data = (self.start_pivot, self.new_arrow_pivot)
+                highlow = detect_extension_reversal(pivots_data, higher1_percent=0.32)
+                self.take_profit = highlow[2]
+                self.entry_line = neckline[-1][1] + 0.002
+                self.entry_pivot = df.iloc[-1]
+                self.point_to_stoploss = abs(self.entry_line - self.stop_loss)
+                self.point_to_take_profit = abs(self.entry_line - self.take_profit)
+                return True
+            elif df.iloc[-1]["high"] > neckline[-1][1] and not self.check_no_SMA(df.iloc[-1050:], neckline[-1][1]):
+                return False
+        else:
+            if df.iloc[-1]["low"] < neckline[-1][1] and not self.check_no_SMA(df.iloc[-1050:], neckline[-1][1]):
+                self.stop_loss = self.highlow_since_new_arrow[0] + 0.006
+                pivots_data = (self.start_pivot, self.new_arrow_pivot)
+                highlow = detect_extension_reversal(pivots_data, lower1_percent=-0.32)
+                self.take_profit = highlow[0]
+                self.entry_line = neckline[-1][1] - 0.002
+                self.entry_pivot = df.iloc[-1]
+                self.point_to_stoploss = abs(self.entry_line - self.stop_loss)
+                self.point_to_take_profit = abs(self.entry_line - self.take_profit)
+                return True
+            elif df.iloc[-1]["low"] < neckline[-1][1] and not self.check_no_SMA(df.iloc[-1050:], neckline[-1][1]):
+                return False
+        return None
+
+    def organize_determined_neck(self):
+        result = []
+        for item in self.determined_neck:
+            while result and item[1] > result[-1][1]:
+                result.pop()
+            result.append(item)
+        self.determined_neck = result
+
+    def price_in_range_while_adjustment(self, df):
+        if self.up_trend:
             high = self.new_arrow_pivot[1]
             low = self.base_fibo70
             judged_price = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0])
@@ -1025,8 +1061,8 @@ def process_data(symbol="USDJPY"):
     
     print("実行中")
     timezone = pytz.timezone("Etc/UTC")
-    fromdate = datetime(2025, 2, 11, 11, 0,tzinfo=timezone)
-    todate   = datetime(2025, 2, 21, 20, 0,tzinfo=timezone)
+    fromdate = datetime(2025, 2, 4, 15, 0, tzinfo=timezone)
+    todate   = datetime(2025, 2, 7, 6, 50, tzinfo=timezone)
 
     original_df = fetch_data_range(symbol,fromdate, todate)
     if original_df is None:
@@ -1111,20 +1147,7 @@ def process_data(symbol="USDJPY"):
  
         
         wm.send_candle_data_tosession(df.iloc[-1100:].copy(), sml_df.iloc[-1100:].copy())
-        time.sleep(0.1)
-        print(f"ラストぴぼと：{last_pivot_data}")
-
-        print("=== Pivot Data ===")
-        for pivot in pivot_data:
-            dt, price, ptype = pivot
-            print(f"Time: {dt}, Price: {price}, Type: {ptype}")
-
-        
-
-    print("=== Pivot Data ===")
-    for pivot in pivot_data:
-        dt, price, ptype = pivot
-        print(f"Time: {dt}, Price: {price}, Type: {ptype}")
+    wm.export_trade_logs_to_csv(filename="trade_logs.csv")
         
 if __name__ == "__main__":
     process_data()
