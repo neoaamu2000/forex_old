@@ -240,6 +240,7 @@ def main():
             writer.writerow([f[0], f[1], f[2], f[3]])
 
     mt5.shutdown()
+    print(pivot_data)
 
 if __name__ == "__main__":
     # Flaskサーバーを別スレッドで起動

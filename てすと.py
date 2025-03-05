@@ -1144,7 +1144,7 @@ import pytz
 
 
 def process_data(symbol="USDJPY"):
-
+    print(f"開始時間：{datetime.now()}")
     global last_pivot_data, sml_last_pivot_data, current_price_global, current_df
 
     pivot_data =[]
@@ -1155,7 +1155,7 @@ def process_data(symbol="USDJPY"):
     
     print("実行中")
     timezone = pytz.timezone("Etc/UTC")
-    fromdate = datetime(2025, 2, 4, 15, 0,tzinfo=timezone)
+    fromdate = datetime(2025, 1, 24, 6, 30,tzinfo=timezone)
     todate   = datetime(2025, 2, 26, 6, 50,tzinfo=timezone)
 
     original_df = fetch_data_range(symbol,fromdate, todate)
@@ -1163,12 +1163,12 @@ def process_data(symbol="USDJPY"):
         shutdown_mt5()
         return
     
-    wm = WaveManager()
+
 
     # 1. SMAを計算しSMAの行をdfに追加する
     
-    df = original_df.iloc[:1600].copy()
-    sml_df = original_df.iloc[:1600].copy()
+    df = original_df.iloc[:1660].copy()
+    sml_df = original_df.iloc[:1660].copy()
     
 # 初期のSMA計算（この時点では200本分）
     df = calculate_sma(df.copy(), window=20, name="BASE_SMA")
@@ -1183,9 +1183,9 @@ def process_data(symbol="USDJPY"):
     last_pivot_data = pivot_data[-1]
     sml_last_pivot_data = sml_pivot_data[-1]
 
-    print(f"開始時間：{df.iloc[-1]["time"]}")
     
-    for idx in range(1600, len(original_df)):
+    
+    for idx in range(1660, len(original_df)):
 
     # 新しいローソク足データ（1行）を取得
         new_row = original_df.copy().iloc[idx:idx+1]
@@ -1204,14 +1204,14 @@ def process_data(symbol="USDJPY"):
         # 3. 20MAのピボット検出
         # --- ピボット検出の更新（直近ウィンドウのみ） ---
         new_pivot = update_detect_pivot(df, point_threshold=0.009, lookback_bars=15, consecutive_bars=3, arrow_spacing=8, name = "BASE_SMA")
-        if new_pivot is not None and new_pivot != last_pivot_data:
-            last_pivot_data = new_pivot
-            pivot_data.append(new_pivot)
-            wm.append_pivot_data(last_pivot_data, df, sml_df)
-            if new_pivot[2] == "high":
-                wm.add_session(pivot_data[-2:], up_trend="False")
-            else:
-                wm.add_session(pivot_data[-2:], up_trend="True")
+        # if new_pivot is not None and new_pivot != last_pivot_data:
+        #     last_pivot_data = new_pivot
+        #     pivot_data.append(new_pivot)
+        #     wm.append_pivot_data(last_pivot_data, df, sml_df)
+        #     if new_pivot[2] == "high":
+        #         wm.add_session(pivot_data[-2:], up_trend="False")
+        #     else:
+        #         wm.add_session(pivot_data[-2:], up_trend="True")
 
 
         # 4. 4MAのピボット検出
@@ -1223,26 +1223,26 @@ def process_data(symbol="USDJPY"):
             name="SML_SMA", 
             arrow_spacing=1
         )    
-        if sml_new_pivot is not None and sml_new_pivot != sml_last_pivot_data:
-            sml_last_pivot_data = sml_new_pivot
-            sml_pivot_data.append(sml_new_pivot)
-            wm.append_sml_pivot_data(sml_last_pivot_data)
+        # if sml_new_pivot is not None and sml_new_pivot != sml_last_pivot_data:
+        #     sml_last_pivot_data = sml_new_pivot
+        #     sml_pivot_data.append(sml_new_pivot)
+        #     wm.append_sml_pivot_data(sml_last_pivot_data)
         
         # ここでは、過去の十分なデータ（例：直近100行）を含めたウィンドウを送るのではなく、
         # 最新の1行のみを取り出す場合の例です。
-        if not df.empty:
-            current_df = df.tail(1)
-        else:
-            continue  # 空なら次のループへ
+        # if not df.empty:
+        #     current_df = df.tail(1)
+        # else:
+        #     continue  # 空なら次のループへ
 
         
-        global current_price_global
-        current_price_global.clear()
-        current_price_global.append(current_df.iloc[-1])
+        # global current_price_global
+        # current_price_global.clear()
+        # current_price_global.append(current_df.iloc[-1])
 
  
         
-        wm.send_candle_data_tosession(df.iloc[-1100:].copy(), sml_df.iloc[-1100:].copy())
+        # wm.send_candle_data_tosession(df.iloc[-1100:].copy(), sml_df.iloc[-1100:].copy())
         # print(f"ラストぴぼと：{last_pivot_data}")
 
 
@@ -1258,7 +1258,7 @@ def process_data(symbol="USDJPY"):
     # for pivot in pivot_data:
     #     dt, price, ptype = pivot
     #     print(f"Time: {dt}, Price: {price}, Type: {ptype}")
-    print(f"トレードログ：{wm.trade_logs}")
+    print(f"完了時間：{datetime.now()}")
         
 if __name__ == "__main__":
     process_data()

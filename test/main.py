@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # main.py
 
 import time
@@ -1252,3 +1253,5 @@ if __name__ == "__main__":
         print(f"------ TPレベル {tp} で実行開始 ------")
         process_data(symbol="USDJPY", tp_level=tp, output_file=output_file)
         print(f"------ TPレベル {tp} で実行終了、出力：{output_file} ------")
+=======
+>>>>>>> main

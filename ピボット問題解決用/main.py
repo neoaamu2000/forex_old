@@ -427,7 +427,7 @@ def process_data(symbol="USDJPY"):
     
     print("実行中")
     timezone = pytz.timezone("Etc/UTC")
-    fromdate = datetime(2025, 2, 17, 0, 0,tzinfo=timezone)
+    fromdate = datetime(2024, 2, 17, 0, 0,tzinfo=timezone)
     todate   = datetime(2025, 2, 18, 7, 0,tzinfo=timezone)
 
     original_df = fetch_data_range(symbol,fromdate, todate)
@@ -464,10 +464,10 @@ def process_data(symbol="USDJPY"):
 
 
 
-    print("=== Pivot Data ===")
-    for pivot in pivot_data:
-        dt, price, ptype = pivot
-        print(f"Time: {dt}, Price: {price}, Type: {ptype}")
+    # print("=== Pivot Data ===")
+    # for pivot in pivot_data:
+    #     dt, price, ptype = pivot
+    #     print(f"Time: {dt}, Price: {price}, Type: {ptype}")
         
 if __name__ == "__main__":
     process_data()
