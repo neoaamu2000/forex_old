@@ -19,7 +19,7 @@ current_price_global = []
 
 
 
-symbol="USDJPY"
+symbol="EURJPY"
 
 last_pivot_data = 999
 sml_last_pivot_data = 999
@@ -435,10 +435,10 @@ class MyModel(object):
         """
         sml_pvts = self.sml_pivots_after_goldencross
         if len(sml_pvts) >= 2 and self.up_trend is True:
-            
+
             for i in range(1, len(sml_pvts)):
                 if sml_pvts[i][2] == "high" and sml_pvts[i][0] > self.state_times["infibos"]:
-                    
+
                     if i + 1 < len(sml_pvts):
                         pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
                         fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,-0.32,0.32,None,None)
@@ -447,8 +447,6 @@ class MyModel(object):
                             self.determined_neck.append(sml_pvts[i])
                             self.organize_determined_neck()
                     else:
-                        pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
-                        fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,-0.32,0.32,None,None)
                         self.potential_neck.append(sml_pvts[i])
 
         if len(sml_pvts) >= 2 and self.up_trend is False:
@@ -461,8 +459,6 @@ class MyModel(object):
                             self.determined_neck.append(sml_pvts[i])
                             self.organize_determined_neck()
                     else:
-                        pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
-                        fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,None,None,-0.32,0.32)
                         self.potential_neck.append(sml_pvts[i])
 
         
@@ -713,23 +709,23 @@ class WaveManager(object):
         for session_id in sessions_to_delete:
             del self.sessions[session_id]
 
-    def export_trade_logs_to_csv(trade_logs, filename="trade_logs.csv"):
+    def export_trade_logs_to_csv(self, filename="trade_logs.csv"):
         import csv
 
-        total_trades = len(trade_logs)
-        wins = sum(1 for trade in trade_logs if trade.get("win") is True)
+        total_trades = len(self.trade_logs)
+        wins = sum(1 for trade in self.trade_logs if trade.get("win") is True)
         win_rate = wins / total_trades if total_trades > 0 else 0
 
         # 勝ち・負けの金額を集計する例（ここでは result が正なら利益、負なら損失と仮定）
-        total_profit = sum(trade.get("result", 0) for trade in trade_logs if trade.get("result", 0) > 0)
-        total_loss = -sum(trade.get("result", 0) for trade in trade_logs if trade.get("result", 0) < 0)
+        total_profit = sum(trade.get("result", 0) for trade in self.trade_logs if trade.get("result", 0) > 0)
+        total_loss = -sum(trade.get("result", 0) for trade in self.trade_logs if trade.get("result", 0) < 0)
         profit_factor = total_profit / total_loss if total_loss > 0 else None
 
         with open(filename, mode="w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
             # ヘッダ行：各トレードのピボットデータ（datetime, price, type）
             writer.writerow(["time", "price", "type"])
-            for trade in trade_logs:
+            for trade in self.trade_logs:
                 # trade には例として、{"time": ..., "price": ..., "type": ..., "win": ..., "result": ...} と記録されているとする
                 time_str = trade["time"].strftime("%Y-%m-%d %H:%M:%S") if hasattr(trade["time"], "strftime") else trade["time"]
                 writer.writerow([time_str, trade["price"], trade["type"]])
@@ -895,7 +891,7 @@ def check_touch_line(center_price, tested_price):
     elif center_price >= tested_price:
         return False
     
-        
+
 # def check_price_reached(price_to_judge):
 #     """
 #     ネックライン超えたか判断するための関数
@@ -1142,7 +1138,7 @@ import pytz
 
 
 
-def process_data(symbol="USDJPY", tp_level=160, output_file="trade_logs.csv"):
+def process_data(symbol="EURJPY", tp_level=160, output_file="EURJPYtrade_logs.csv"):
     global last_pivot_data, sml_last_pivot_data, current_price_global, current_df
 
     pivot_data =[]
@@ -1153,7 +1149,7 @@ def process_data(symbol="USDJPY", tp_level=160, output_file="trade_logs.csv"):
     
     print("実行中")
     timezone = pytz.timezone("Etc/UTC")
-    fromdate = datetime(2023, 1, 18, 0, 0, tzinfo=timezone)
+    fromdate = datetime(2025, 1, 5, 0, 0, tzinfo=timezone)
     todate   = datetime(2025, 2, 20, 6, 50, tzinfo=timezone)
 
     original_df = fetch_data_range(symbol,fromdate, todate)
@@ -1242,7 +1238,7 @@ def process_data(symbol="USDJPY", tp_level=160, output_file="trade_logs.csv"):
         
         wm.send_candle_data_tosession(df.iloc[-1100:].copy(), sml_df.iloc[-1100:].copy())
 
-    wm.export_trade_logs_to_csv(wm.trade_logs, filename=output_file)
+    wm.export_trade_logs_to_csv(filename="EURJPYtrade_logs.csv")
 
 
 if __name__ == "__main__":

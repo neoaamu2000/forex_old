@@ -5,210 +5,169 @@ import MetaTrader5 as mt5
 from datetime import datetime, timedelta
 import threading
 from transitions.extensions import HierarchicalMachine as Machine
-import MetaTrader5 as mt5
 import csv
 import pandas as pd
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor
+import os
+import pytz
 
 from login import initialize_mt5, shutdown_mt5
-from transitions.extensions import HierarchicalMachine as Machine
 
+np.set_printoptions(threshold=np.inf)
+# （Machine のimportは重複しているので必要に応じて整理してください）
 
 # セッション管理用のグローバル WaveManager インスタンス
-
 current_price_global = []
 
 
-
-symbol="USDJPY"
-
+symbol = "USDJPY"  # デフォルト値
 last_pivot_data = 999
 sml_last_pivot_data = 999
 
-
 states = [
     "created_base_arrow",
-    "touched_20",
     "created_new_arrow",
-    {"name":"infibos", "children":"has_determined_neck", 'initial': False},
+    {"name": "infibos", "children": "has_determined_neck", 'initial': False},
     "has_position",
     "closed"
 ]
 
 # 遷移定義
 transitions = [
-    {"trigger": "touch_20", "source": "created_base_arrow", "dest": "touched_20"},
-    {"trigger": "create_new_arrow", "source": "touched_20", "dest": "created_new_arrow"},
+    {"trigger": "create_new_arrow", "source": "created_base_arrow", "dest": "created_new_arrow"},
     {"trigger": "touch_37", "source": ["created_new_arrow", "infibos_has_determined_neck"], "dest": "infibos"},
     {"trigger": "neck_determine", "source": "infibos", "dest": "infibos_has_determined_neck"},
-    {"trigger": "build_position", "source": ["infibos","infibos_has_determined_neck"], "dest": "has_position"},
+    {"trigger": "build_position", "source": ["infibos", "infibos_has_determined_neck"], "dest": "has_position"},
     {"trigger": "close", "source": "has_position", "dest": "closed"}
 ]
+
 
 #############################################
 # セッションクラス（各セッションの状態を管理）
 #############################################
 class MyModel(object):
-    def __init__(self, name, pivot_data, up_trend):
+    def __init__(self, name, start_index, start_time_index,  prev_index, prev_time_index, up_trend="True"):
+        print(start_index)
         self.name = name
-        self.pivot_data = pivot_data[-2:]  # セッション開始時点のピボットデータのコピー
-        self.start_pivot = pivot_data[-1] if pivot_data else datetime.now()
+        self.full_data = []
+        self.start_index = start_index
+        self.prev_index = prev_index
+        # self.pivot_data = pivot_data[-2:]  # セッション開始時点のピボットデータのコピー
+        # self.start_pivot = pivot_data[-1] if pivot_data else datetime.now()
         self.machine = Machine(model=self, states=states, transitions=transitions, initial="created_base_arrow")
-        self.new_arrow_pivot = None #推進波の終わりの最高（安）値を保管。ここ以降を調整波と考えられる。append_pivot_dataで設定される
-        self.base_fibo37 = [] #推進波に対してリトレースメント37%を知るための変数
-        self.base_fibo70 = []
+        self.new_arrow_index = None  # 推進波の終わりの最高（安）値を保管（以降調整波と考える）
+        self.next_new_arrow_index = None
+        self.fibo_minus_20 = None
+        self.fibo_minus_200 = None
+        
+        self.base_fibo37 = []  # 推進波に対する37%リトレースメントライン
+        self.base_fibo70 = [] # 推進波に対する70%リトレースメントライン
+        self.max_neck = []
         self.time_of_goldencross = []
-        self.highlow_since_new_arrow = [] #上昇トレンドの調整波の戻しの深さを知るための変数
-        self.sml_pivot_data = [] #append_sml_pivot_dataでtouch20以降sml_pivotsを記録
+        self.highlow_since_new_arrow = []  # 調整波の戻しの深さを把握
+        self.sml_pivot_data = []  # touch20以降のsml_pivotを記録
 
-#-------------ネックラインに関する制作-----------------
+        # ネックライン関連
         self.sml_pivots_after_goldencross = []
         self.potential_neck = []
         self.determined_neck = []
 
         self.destroy_reqest = False
 
+        self.up_trend = True if up_trend == "True" else False
 
-        if up_trend == "True":
-            self.up_trend = True
-        if up_trend == "False":
-            self.up_trend = False
+        self.state_times = {}  # 各状態移行時刻
 
-        self.state_times = {} #stateが移行した時の時刻を記録
-
-        #base_arrowができるまでの最後の波に対してフィボナッチをあて
-        #上(下)20%のライン(self.fibo_minus_20)に波が触れてこれば
-        #そちらの方向への推進波ととらえることができる
-        if up_trend == "True":
-            _,_,self.fibo_minus_20, self.fibo_minus_200 = detect_extension_reversal(self.pivot_data[-2:],None, None, 0.2, 2)
-        if up_trend == "False":
-            self.fibo_minus_20, self.fibo_minus_200,_,_ = detect_extension_reversal(self.pivot_data[-2:],-0.2,-2,None, None)
-
+        # 最後の2ピボットからフィボナッチラインを設定
         
 
-        # 状態に応じた処理関数のディスパッチテーブルを定義
+        # 状態に応じた処理関数のディスパッチテーブル
         self.state_actions = {
             "created_base_arrow": self.handle_created_base_arrow,
-            "touched_20": self.handle_touched_20,
             "created_new_arrow": self.handle_created_new_arrow,
             "infibos": self.handle_infibos,
-            "infibos_has_determined_neck":self.handle_infibos_has_determined_neck,
+            "infibos_has_determined_neck": self.handle_infibos_has_determined_neck,
             "has_position": self.handle_has_position,
             "closed": self.handle_closed
         }
 
-    def execute_state_action(self, df, sml_df): #現時点ではdf直近100件　df.iloc[-100:]
-        """
-        現在の状態に対応する処理関数を実行する
-        """
-        action = self.state_actions.get(self.state)
-        if action:
-            # 必要に応じて df を渡す
-            action(df.copy(), sml_df.copy())
-        else:
-            pass
 
-    # 各状態で実行される関数
-    def handle_created_base_arrow(self, df, sml_df):
-        # print(f"{self.name}: Handling 'created_base_arrow'")
-        if self.up_trend is True and check_touch_line(self.fibo_minus_20,df.iloc[-1]["high"]):
-            self.touch_20()
-        elif self.up_trend is False and check_touch_line(self.fibo_minus_20,df.iloc[-1]["low"]) is False:
-            self.touch_20()
-        else:
-            pass
 
-    #矢印形成（append_pivot_data）で詳細条件作成
-    def handle_touched_20(self, df, sml_df):
-        if self.up_trend is True:
-            result = watch_price_in_range(self.start_pivot[1], self.fibo_minus_200, df.iloc[-1]["high"])
-        elif self.up_trend is False:
-            result = watch_price_in_range(self.fibo_minus_200, self.start_pivot[1], df.iloc[-1]["low"])
-        
-        if result is False:
+    def execute_state_action(self):
+        """現在の状態に対応する処理関数を実行"""
+        while self.destroy_reqest == False:
+            action = self.state_actions.get(self.state)
+            if action:
+                action()
+
+    def handle_created_base_arrow(self):
+        total_len = len(self.full_data)
+        base_pivots_index = self.get_pivots_in_range(self.start_index,total_len-1,base_or_sml="base")
+        indices_after = base_pivots_index[base_pivots_index > self.start_index]
+
+        if indices_after.size >= 2:
+            self.new_arrow_index = indices_after[0]
+            self.next_new_arrow_index = indices_after[1]
+        else:
             self.destroy_reqest = True
-            print(f"{self.name}:200のラインに触れたので削除")
-        # print(f"名前：{self.name}、リザルト、{result},リクエスト:{self.destroy_reqest},カレント：{current_df.iloc[-1]["time"]}")
-        # print(f"{self.name}: Handling 'touched_20'")
+            return
         
+        
+        if self.up_trend:
+            print(self.full_data)
+            prev_price, start_price = self.full_data[self.prev_index,2], self.full_data[self.start_index,3]
+            _,_,self.fibo_minus_20,self.fibo_minus_200, = detect_extension_reversal(prev_price, start_price,None, None, 0.2, 2)
+            judged_price = self.full_data[self.new_arrow_index,2]
+        elif not self.up_trend:
+            prev_price, start_price = self.full_data[self.prev_index,3], self.full_data[self.start_index,2]
+            self.fibo_minus_20, self.fibo_minus_200,_,_ = detect_extension_reversal(prev_price, start_price,-0.2,-2,None, None)
+            judged_price = self.full_data[self.new_arrow_index,3]
+
+        if self.watch_price_in_range(self.fibo_minus_20,self.fibo_minus_200,judged_price):
+            self.create_new_arrow()
+        else:
+            self.destroy_reqest == True
 
 
-    def handle_created_new_arrow(self, df, sml_df):
-        # print(f"{self.name}: Handling 'created_new_arrow'")
-        self.highlow_since_new_arrow = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0]) 
-        # print(f"前のぴぼと：{df.iloc[-1]}")
-        if self.up_trend is True and check_touch_line(self.base_fibo37, self.highlow_since_new_arrow[1]) is False:
-            #調整の深さを判断するので、推進波に対して37%戻したラインより前回のローソクの最安値(df.iloc[-1]["low"])が低ければ調整完了と判断
+    def handle_created_new_arrow(self):
+        highest, lowest =self.get_high_and_low_in_term(self.new_arrow_index, self.next_new_arrow_index,False)
+        if self.up_trend is True and self.watch_price_in_range(self.base_fibo37,self.base_fibo70, lowest) is False:
             self.touch_37()
-        elif self.up_trend is False and check_touch_line(self.base_fibo37, self.highlow_since_new_arrow[0]) is True:
+        elif self.up_trend is False and self.watch_price_in_range(self.base_fibo37,self.base_fibo70, highest) is True:
             self.touch_37()
         else:
             pass
-        
-        self.price_in_range_while_adjustment(df)
 
-    #↓を修正して↑になったけど、↓はエントリー時の戻しの深さの最終チェックに使えるかも
-    # def handle_created_new_arrow(self, df):
-    #     print(f"{self.name}: Handling 'created_new_arrow'")
-    #     self.highlow_since_new_arrow = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0])#推進波の終わり以降の最高（安）値（調整の最も深い価格）を取得
-    #     if self.up_trend is True and check_touch_line(self.base_fibo37, self.highlow_since_new_arrow[1]) is False:
-    #         self.touch_37()
-    #     elif self.up_trend is False and check_touch_line(self.base_fibo37, self.highlow_since_new_arrow[0]) is True:
-    #         self.touch_37()
-    #     else:
-    #         pass
 
-#--------------------ここから------------------------------
-    
-    # def handle_infibos(self, df, sml_df):
-    #     self.price_in_range_while_adjustment(df)
-        
-    #     if self.potential_neck:
-    #         if self.check_potential_entry() is True:
-    #             self.build_position()
-    #         elif self.check_potential_entry() is False:
-    #             self.potential_neck = []
-    #     elif len(self.determined_neck) > 0:
-    #         self.neck_determine()
 
-    def handle_infibos(self, df, sml_df):
+    def handle_infibos(self):
         if self.potential_neck:
             entry_result = self.potential_entry(df, self.potential_neck)
             if entry_result is True:
                 self.build_position()
-                
             elif entry_result is False:
                 self.potential_neck = []
         elif len(self.determined_neck) > 0:
             self.neck_determine()
         self.price_in_range_while_adjustment(df)
-        
 
-    #if self.name == "Session_2":
-    #     print(f"ここでセッション２テスト！セッション名:{self.name},トレンド：{self.up_trend},開始：{self.start_pivot}、スモール：{self.sml_pivot_data}")
-    #     print("ゴールデンクロス後のぴぼと",self.sml_pivots_after_goldencross)
-    #     print(f"{self.name}: トレンド：{self.up_trend},ゴールデンクロス{self.sml_pivots_after_goldencross},ポテンシャル{self.potential_neck},デターミンド{self.determined_neck}、カレント{current_df}ステートタイム{self.state_times}")
-
-
-    def handle_infibos_has_determined_neck(self, df, sml_df):
-
+    def handle_infibos_has_determined_neck(self):
         if self.potential_neck:
             entry_result = self.potential_entry(df, self.potential_neck)
             if entry_result is True:
                 self.build_position()
             elif entry_result is False:
                 self.potential_neck = []
-        
+
         if "has_position" not in self.state:
-            self.highlow_since_new_arrow = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0])
+            self.highlow_since_new_arrow = self.ml_pivots_after_goldencrom(self.new_arrow_index)
             if self.up_trend is True:
                 for neckline in self.determined_neck[:]:
                     if self.state != 'infibos_has_determined_neck':
-                        break  # 状態が変わっていたら処理中断
-                    # print(f"ネックライン[1]：{neckline[1]}")
-                    # print(f"ネックライン[-1][1]：{neckline[-1][1]}")
-                    if df.iloc[-1]["high"] > neckline[1] and self.check_no_SMA(df.iloc[-1050:],neckline[1]):
-                        
-                        self.stop_loss = self.highlow_since_new_arrow[1] - 0.006 #推進波終了以降の最も調整の深い部分から0.006円低い価格を取得
+                        break
+                    if df.iloc[-1]["high"] > neckline[1] and self.check_no_SMA(df.iloc[-1050:], neckline[1]):
+                        self.stop_loss = self.highlow_since_new_arrow[1] - 0.006
                         pivots_data_to_get_take_profit = self.start_pivot, self.new_arrow_pivot
                         highlow = detect_extension_reversal(pivots_data_to_get_take_profit, higher1_percent=0.32)
                         self.take_profit = highlow[2]
@@ -217,42 +176,33 @@ class MyModel(object):
                         self.point_to_take_profit = abs(self.entry_line - self.take_profit)
                         self.point_to_stoploss = abs(self.entry_line - self.stop_loss)
                         self.build_position()
-                    elif df.iloc[-1]["high"] > neckline[1] and self.check_no_SMA(df.iloc[-1050:],neckline[1]) is False:
+                    elif df.iloc[-1]["high"] > neckline[1] and self.check_no_SMA(df.iloc[-1050:], neckline[1]) is False:
                         self.determined_neck.remove(neckline)
                         if not self.determined_neck:
                             self.touch_37()
-
-            if self.up_trend is False:
+            else:
                 for neckline in self.determined_neck[:]:
                     if self.state != 'infibos_has_determined_neck':
-                        break  # 状態が変わっていたら処理中断
-                    # print(f"ネックライン[1]：{neckline[1]}")
-                    # print(f"ネックライン[-1][1]：{neckline[-1][1]}")
-
-                    if df.iloc[-1]["low"] < neckline[1] and self.check_no_SMA(df.iloc[-1050:],neckline[1]) is False:
-                        self.stop_loss = self.highlow_since_new_arrow[0] + 0.006 #推進波終了以降の最も調整の深い部分から0.006円高い価格を取得
+                        break
+                    if df.iloc[-1]["low"] < neckline[1] and self.check_no_SMA(df.iloc[-1050:], neckline[1]) is False:
+                        self.stop_loss = self.highlow_since_new_arrow[0] + 0.006
                         pivots_data_to_get_take_profit = self.start_pivot, self.new_arrow_pivot
-                        highlow = detect_extension_reversal(pivots_data_to_get_take_profit, lower1_percent= -0.32)
+                        highlow = detect_extension_reversal(pivots_data_to_get_take_profit, lower1_percent=-0.32)
                         self.take_profit = highlow[0]
                         self.entry_line = neckline[1] - 0.002
                         self.entry_pivot = df.iloc[-1]
                         self.point_to_stoploss = abs(self.entry_line - self.stop_loss)
                         self.point_to_take_profit = abs(self.entry_line - self.take_profit)
                         self.build_position()
-                        
-                    elif df.iloc[-1]["low"] < neckline[1] and self.check_no_SMA(df.iloc[-1050:],neckline[1]) is False:
+                    elif df.iloc[-1]["low"] < neckline[1] and self.check_no_SMA(df.iloc[-1050:], neckline[1]) is False:
                         self.determined_neck.remove(neckline)
                         if not self.determined_neck:
                             self.touch_37()
 
         self.price_in_range_while_adjustment(df)
 
-        
-    
     def handle_has_position(self, df, sml_df):
-
         if self.up_trend is True:
-            
             if df.iloc[-1]["low"] < self.stop_loss:
                 self.win = False
                 self.result = -1
@@ -261,8 +211,7 @@ class MyModel(object):
                 self.win = True
                 self.result = self.point_to_take_profit / self.point_to_stoploss
                 self.close()
-
-        if self.up_trend is False:
+        else:
             if df.iloc[-1]["high"] > self.stop_loss:
                 self.win = False
                 self.result = -1
@@ -274,36 +223,24 @@ class MyModel(object):
 
     def handle_closed(self, df, sml_df):
         self.destroy_reqest = True
-        
-                
 
-
-    # on_enter-------------------------------------
-    # on_enter-------------------------------------
-    # on_enter-------------------------------------
-    # on_enter-------------------------------------
-    # on_enter-------------------------------------
-
+    # on_enter 系
     def record_state_time(self):
-        """状態が遷移した際に状態名と時刻を記録"""
         state_name = self.state
         self.state_times[state_name] = current_df.iloc[-1]["time"]
 
     def on_enter_created_new_arrow(self):
-        """
-        ここで推進波に対しての37%の戻りを定義しておく。
-        上昇波であればhighに対して37%の戻り
-        下降波であればlowに対して37%の戻り
-        """
+        print("どうだね？",self.state)
         self.record_state_time()
+        prices = [self.full_data[self.start_index:10],self.full_data[self.new_arrow_index:10]]
         
-        pvts = self.start_pivot, self.new_arrow_pivot
         if self.up_trend is True:
-            self.base_fibo70,_,self.base_fibo37,_ = detect_extension_reversal(pvts,lower1_percent=0.3, higher1_percent=-0.37)
+            self.base_fibo70, _, self.base_fibo37, _ = detect_extension_reversal(prices, lower1_percent=0.3, higher1_percent=-0.37)
         else:
-            self.base_fibo37,_,self.base_fibo70,_ = detect_extension_reversal(pvts,lower1_percent=0.37, higher1_percent=-0.3)
+            self.base_fibo37, _, self.base_fibo70, _ = detect_extension_reversal(prices, lower1_percent=0.37, higher1_percent=-0.3)
+        self.time_of_goldencross = self.get_golden_cross_time()
 
-
+        
 
     def on_enter_infibos(self):
         self.record_state_time()
@@ -311,11 +248,15 @@ class MyModel(object):
 
     def on_enter_has_position(self):
         self.record_state_time()
-        print(f"名前：{self.name}, エントリーライン：{self.entry_line}、テイクプロフィット：{self.take_profit}、ストップロス：{self.stop_loss}、エントリーピボット：{self.entry_pivot}、ポイント：{self.point_to_stoploss}、ポイント：{self.point_to_take_profit}、ステート時間：{self.state_times}")
-    
+        print(f"名前：{self.name}, エントリーライン：{self.entry_line}、テイクプロフィット：{self.take_profit}、"
+              f"ストップロス：{self.stop_loss}、エントリーピボット：{self.entry_pivot}、"
+              f"ポイント：{self.point_to_stoploss}、ポイント：{self.point_to_take_profit}、"
+              f"ステート時間：{self.state_times}")
+
     def on_enter_closed(self):
         self.record_state_time()
         print(f"{self.name}: Entered 'くろーず' state.")
+
     def __repr__(self):
         return f"MyModel(name={self.name}, state={self.state})"
 
@@ -326,28 +267,21 @@ class MyModel(object):
 #その他の今後も特に使いそうな機能
 #---------------------------------------------------------------------
 
-    def should_check():
-        """現在の秒数がチェック対象の範囲内か判定する。"""
-        # 現在の秒を取得
-        sec = datetime.now().second
-        # 例えば、58秒〜59秒、もしくは0秒〜3秒の間をチェック対象にする
-        return sec >= 54 or sec <= 2
-    
-    def get_high_and_low_in_term(self, df,time):
+    def get_high_and_low_in_term(self,start_index,end_index,close):
         """
         dfから、指定した期間以降の最高値と最安値を検出しreturnする
         """
-        if df.index.name != "time":
-            df = df.set_index("time", drop=False)
-        required_df = df[time:].copy()
-        highest_price = required_df[["open", "high", "low", "close"]].max().max()
-        lowest_price = required_df[['open', 'high', 'low', 'close']].min().min()
-        highest_close = required_df["close"].max()
-        lowest_close = required_df["close"].min()
+        required_data = self.full_data[start_index:end_index]
+        highest_price = required_data[:,2].max()
+        lowest_price = required_data[:,3].min()
+        if close:
+            highest_close = required_data[:,4].max()
+            lowest_close = required_data[:,4].min()
+            return highest_price, lowest_price, highest_close, lowest_close
+        else:
+            return highest_price, lowest_price
 
-        return highest_price, lowest_price, highest_close, lowest_close
-
-    def get_golden_cross_time(self,df,sml_df):
+    def get_golden_cross_time(self):
         """
         dfは過去100本のローソクのデータ(datetime型のtime,open,close,high,low,20MAの値など)
         sml_dfは過去100本のローソクのデータ(datetime型のtime,open,close,high,low,4MAの値など)
@@ -357,22 +291,21 @@ class MyModel(object):
         調整波として完全に基準を満たしていると判断することができる
         USDJPY 2/19 13:22付近でのエントリーみたいなのをなくすための措置
         """
-        df_indexed = df.copy().set_index("time", drop=False)
-        sml_df_indexed = sml_df.copy().set_index("time", drop=False)
-        base_sma_since_new_arrow = df_indexed.loc[self.new_arrow_pivot[0]:].copy()
-        sml_sma_since_new_arrow = sml_df_indexed.loc[self.new_arrow_pivot[0]:].copy()
+        
+        base_sma_since_new_arrow = self.full_data[self.new_arrow_index:self.next_new_arrow_index,7]
+        sml_sma_since_new_arrow = self.full_data[self.new_arrow_index:self.next_new_arrow_index,8]
+        
 
         if self.up_trend is True:
-            for i in range(0, len(base_sma_since_new_arrow)):
-                if base_sma_since_new_arrow.iloc[i]["BASE_SMA"] > sml_sma_since_new_arrow.iloc[i]["SML_SMA"]:
-                    return base_sma_since_new_arrow.iloc[i]["time"] - timedelta(minutes=1)
-            return df.iloc[-1]["time"]
-            
+            conditions = np.where(base_sma_since_new_arrow > sml_sma_since_new_arrow)
         elif self.up_trend is False:
-            for i in range(0, len(base_sma_since_new_arrow)):
-                if base_sma_since_new_arrow.iloc[i]["BASE_SMA"] < sml_sma_since_new_arrow.iloc[i]["SML_SMA"]:
-                    return base_sma_since_new_arrow.iloc[i]["time"] - timedelta(minutes=1)
-            return df.iloc[-1]["time"]
+            conditions = np.where(base_sma_since_new_arrow < sml_sma_since_new_arrow)
+        
+        if conditions[0].size > 0:
+            self.index_of_goldencross = conditions[0][0] + self.new_arrow_index
+        else:
+            self.index_of_goldencross = self.new_arrow_index
+
 
         
     def check_no_SMA(self,df,neckline):
@@ -416,13 +349,18 @@ class MyModel(object):
         
 
 
-    def get_sml_pivots_after_goldencross(self,sml_pivots):
+    def get_pivots_in_range(self,idx1,idx2,base_or_sml):
         """
         goldencross以降のsmall_pivotsのデータを取得するメソッド
         """
-        for idx, pivot in enumerate(sml_pivots):
-            if pivot[0] > self.time_of_goldencross - timedelta(minutes=1):
-                self.sml_pivots_after_goldencross = sml_pivots[idx:]
+        pivot_arr = self.full_data[idx1:idx2, 10] if base_or_sml == "base" else self.full_data[:, 13]
+        valid = ~np.isnan(pivot_arr)
+        valid_indices = np.where(valid)[0]
+
+        return valid_indices
+
+    # self.start_index 以降の有効なインデックスだけ抽出して、最初の要素を選ぶ
+        
 
     def get_potential_neck_wheninto_newarrow(self):
         """
@@ -433,10 +371,12 @@ class MyModel(object):
         ネックラインになりうるpivotの次のpivotが生成されてなければ
         potential_neckに格納。(この場合次のpivot確定待ち)
         """
+        print(self.up_trend,self.time_of_goldencross)
         sml_pvts = self.sml_pivots_after_goldencross
         if len(sml_pvts) >= 2 and self.up_trend is True:
-            
+            # print(f"名前：{self.name},ステート時間：{self.state_times},ゴールデンクロス：{self.time_of_goldencross}")
             for i in range(1, len(sml_pvts)):
+                # print(f"名前：{self.name},ステート時間：{self.state_times}")
                 if sml_pvts[i][2] == "high" and sml_pvts[i][0] > self.state_times["infibos"]:
                     
                     if i + 1 < len(sml_pvts):
@@ -474,23 +414,9 @@ class MyModel(object):
         sml_pvts = self.sml_pivots_after_goldencross
 
         if self.potential_neck:
-        #     print(f"名前：{self.name}\n"
-        #         f"ここでテスト！セッション名：{self.name}\n"
-        #         f"カレント：{current_df['time']}\n"
-        #         f"開始：{self.start_pivot}\n"
-        #         f"トレンド：{self.up_trend}\n"
-        #         f"ステート：{self.state}\n"
-        #         f"スターと：{self.new_arrow_pivot}\n"
-        #         f"ニューアロー：{self.new_arrow_pivot}\n"
-        #         f"ポテンシャル：{self.potential_neck}\n"
-        #         f"デタマイン：{self.determined_neck}\n"
-        #         f"ベース37：{self.base_fibo37}\n"
-        #         f"ベース70：{self.base_fibo70}\n"
-        #         f"ゴールデンクロス：{self.time_of_goldencross}\n"
-        #         f"スモール：{self.sml_pivot_data}\n"
-        #         f"ゴールデンクロス後のスモール：{self.sml_pivots_after_goldencross}\n"
-
-        # )
+            if len(sml_pvts) < 3:
+                self.destroy_reqest = True
+                return None
 
             pvts_to_get_32level = [sml_pvts[-3], self.potential_neck[-1]]
 
@@ -558,46 +484,60 @@ class MyModel(object):
             result.append(item)
         self.determined_neck = result
 
+    def watch_price_in_range(self,low,high,judged_price):
+        low = min(low, high)
+        high = max(low, high)
+        if low <= judged_price <= high:
+            return True
+        else:
+            return False
 
-    def price_in_range_while_adjustment(self,df):
-        if self.up_trend is True:
 
-            high = self.new_arrow_pivot[1]
-            low = self.base_fibo70
-            judged_price = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0])
-            if high < judged_price[0] or low > judged_price[1]:
-                
-                self.destroy_reqest = True
-                # print(f"Session {self.name}：調整中に推進波と70ラインの範囲外に出て削除")
-                # print(f"ステート：{self.state}、カレント：{current_df},ハイ：{judged_price[0]},ロー：{judged_price[1]}")
-
-        elif self.up_trend is False:
-            high = self.base_fibo70
-            low = self.new_arrow_pivot[1]
-            judged_price = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0])
-            if high < judged_price[0] or low > judged_price[1]:
-                self.destroy_reqest = True
-                # print(f"Session {self.name}：調整中に推進波と70ラインの範囲外に出て削除")
+    def price_in_range_while_adjustment(self, df):
+        if self.up_trend:
+            high, low = self.new_arrow_pivot[1], self.base_fibo70
+        else:
+            high, low = self.base_fibo70, self.new_arrow_pivot[1]
+        
+        judged_price = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0])
+        if high < judged_price[0] or low > judged_price[1]:
+            self.destroy_reqest = True
         
 
 
 #############################################
-# セッションマネージャークラス
+# マネージャークラス
 #############################################
 class WaveManager(object):
     def __init__(self):
         self.sessions = {}  # セッションは session_id をキーに管理
         self.next_session_id = 1
         self.trade_logs = []
+        self.full_data = []
 
 
-    def add_session(self, pivot_data, up_trend):
+    def analyze_sessions(self):
+        
+
+        for session_id in list(self.sessions.keys()):
+            session = self.sessions[session_id+30]
+            session.full_data = self.full_data[session.prev_index-100:session.start_index+1500,:]
+            session.start_index = session.start_index - session.prev_index + 100
+            session.prev_index = 100
+            session.execute_state_action()
+
+            del self.sessions[session_id]
+
+
+    def add_session(self, start_index, start_time_index, prev_index, prev_time_index, up_trend):
         """
         新しいセッションを生成して管理リストに追加する。
         """
-        session = MyModel(f"Session_{self.next_session_id}", pivot_data, up_trend)
+        
+        session = MyModel(f"Session_{self.next_session_id}", start_index, start_time_index, prev_index, prev_time_index, up_trend)
         self.sessions[self.next_session_id] = session
-        print(f"New session created: {session},時間:{pivot_data}、アプトレ{session.up_trend}")
+        
+        # print(f"New session created: {session}")
         self.next_session_id += 1
         return session
 
@@ -687,20 +627,17 @@ class WaveManager(object):
         for session_id in sessions_to_delete:
             del self.sessions[session_id]
             print(f"Session {session_id} 削除、最終的にちゃんと実行.")
-        
-            
-
-        
-
 
     
+        
+
 
     def check_in_range(self):
         avoid_state = "created_base_arrow", "build_position","position_reached161","position_reached200"
         sessions_to_delete = []
         for session_id, session in self.sessions.items():
             if session.state not in avoid_state:
-                if session.up_trend == True:    
+                if session.up_trend is True:    
                     result = watch_price_in_range(session.pivot_data[1],session.high150)
                     if result is False:
                         sessions_to_delete.append(session_id)
@@ -751,82 +688,9 @@ class WaveManager(object):
 
     def __repr__(self):
         return f"WaveManager(sessions={list(self.sessions.values())})"
-    
-
-def initialize_mt5():
-    """
-    MT5への接続を初期化する。
-    接続に成功すればTrue、失敗すればFalseを返す。
-    """
-    if not mt5.initialize():
-        print("MT5の初期化に失敗しました")
-        return False
-    return True
-
-def shutdown_mt5():
-    """
-    MT5の接続をシャットダウンする。
-    """
-    mt5.shutdown()
 
 
-def fetch_data_range(symbol,from_date, to_date, timeframe=mt5.TIMEFRAME_M1 ):
-    """
-    指定された期間のデータを取得して DataFrame として返す。
-    
-    Args:
-        symbol (str): 通貨ペア（例: "USDJPY"）
-        timeframe: MT5 のタイムフレーム（例: mt5.TIMEFRAME_M1）
-        from_date (datetime): 取得開始日時
-        to_date (datetime): 取得終了日時
-        
-    Returns:
-        DataFrame または None
-    """
-    if from_date is None or to_date is None:
-        print("from_date と to_date を指定してください")
-        return None
-
-    if not mt5.initialize():
-        print("MT5 の初期化に失敗しました")
-        return None
-
-    rates = mt5.copy_rates_range(symbol, timeframe, from_date, to_date)
-    if rates is None:
-        print("データが取得できませんでした")
-        shutdown_mt5()
-        return None
-
-    df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s')
-    shutdown_mt5()
-    return df
-    
-
-# def update_current_price(symbol, interval=0.1):
-#     """スレッド関数内で MT5 を初期化し、一定間隔でティック価格を取得して global に格納。"""
-#     if not mt5.initialize():
-#         print("MT5の初期化に失敗しました")
-#         return
-#     print("MT5 initialized in thread.")
-
-#     while True:
-#         tick = mt5.symbol_info_tick(symbol)
-#         if tick is not None:
-#             global current_price_global
-#             current_price_global.clear()
-#             current_price_global.append(tick)
-#             print(f"Updated price: {current_price_global}")
-#         else:
-#             print("ティックデータ取得失敗（update_current_price）")
-#         time.sleep(interval)
-
-
-
-
-
-
-def detect_extension_reversal(pivot_data, lower1_percent=None, lower2_percent=None, higher1_percent=None, higher2_percent=None):
+def detect_extension_reversal(price1,price2,lower1_percent=None, lower2_percent=None, higher1_percent=None, higher2_percent=None):
     """
     low1はフィボナッチあてる2点のうち低い方の価格を0として考える。
     high1はフィボナッチあてる2点のうち高い方の価格を0として考える。
@@ -834,12 +698,9 @@ def detect_extension_reversal(pivot_data, lower1_percent=None, lower2_percent=No
     low2に0.4を入れると154、high1に-0.2を入れると158、high2に0.2を入れると162
     """    
     
-    if len(pivot_data) < 2:
-        return (None, None)
-    
     # 前回と直近のピボットの価格を取り出す
-    price1 = pivot_data[-2][1]
-    price2 = pivot_data[-1][1]
+    price1 = price1
+    price2 = price2
     
     # 波の低い方と高い方を求める
     low_val = min(price1, price2)
@@ -894,87 +755,38 @@ def check_touch_line(center_price, tested_price):
         return True
     elif center_price >= tested_price:
         return False
-    
-        
-# def check_price_reached(price_to_judge):
-#     """
-#     ネックライン超えたか判断するための関数
-#     指定した価格より現在の価格が上にあるか下にあるかを返す関数
-#     True → 現在価格がprice_to_judgeよりも上にある
-#     False → 現在価格がprice_to_judgeよりも下にある
-#     """
-#     if current_price_global >= price_to_judge:
-#         return True
-#     elif current_price_global <= price_to_judge:
-#         return False
 
 
+#-----------------------------------------------
 
-    
-def watch_price_in_range(low,high,judged_price = current_price_global):
-    low = min(low, high)
-    high = max(low, high)
-    if low <= judged_price <= high:
-        return True
-    else:
-        return False
-    
-
-    
-
-
-
-#------------------------------------------------------------------------------------
-#直接はトレードに関係ない系
-
-def save_fibonacci_to_csv(fib_data, filename="fibs.csv"):
+def calculate_sma(np_arr, window=20):
     """
-    フィボナッチ矩形情報をCSV形式で保存する（デバッグ用）。
-    
+    NumPy配列に対してSMA（単純移動平均）を計算します。
+
     Args:
-        fib_data (list): (time_start, time_end, price_lower, price_upper)のタプルのリスト。
-        filename (str): 出力先ファイル名。
-    """
-    with open(filename, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(["time_start", "time_end", "price_lower", "price_upper"])
-        for f in fib_data:
-            time_start = f[0].strftime('%Y-%m-%d %H:%M') if hasattr(f[0], 'strftime') else f[0]
-            time_end   = f[1].strftime('%Y-%m-%d %H:%M') if hasattr(f[1], 'strftime') else f[1]
-            writer.writerow([time_start, time_end, f[2], f[3]])
-
-def calculate_sma(df, window=20, name = "SMA?"):
-    """
-    DataFrameに対してSMA（単純移動平均）を計算し、'sma25'列として追加する。
-    
-    Args:
-        df (DataFrame): 入力データ（少なくとも'close'列が必要）。
+        np_arr (numpy.ndarray): 入力データ。少なくとも4列目（インデックス3）が 'close' 値として使われる。
         window (int): 移動平均のウィンドウサイズ（デフォルト20）。
-        
+
     Returns:
-        DataFrame: SMA計算後のデータフレーム。
+        numpy.ndarray: 計算されたSMAの1次元配列。最初の window-1 要素はNaNになります。
     """
-    df = df.copy()  # 明示的なコピー作成
-    df[name] = df['close'].rolling(window=window).mean()
-    df[name] = df[name].ffill()
-    df = df.reset_index(drop=True)
-    return df
+    np_arr = np_arr.copy()  # 入力配列のコピー作成
+    close = np_arr[:, 4]
+    kernel = np.ones(window, dtype=np.float64) / window #過去window分を合計してwindowで割ればＳＭＡの値とれる
+    sma_valid = np.convolve(close, kernel, mode="valid") #closeに対してkarnelを当てていき、完全にwindow分取得できるところから格納する
+    # 最初の window-1 行は計算できないので NaN で埋める
+    sma_arr = np.empty_like(close)
+    sma_arr[:window-1] = np.nan #windowが4としたら[3]
+    sma_arr[window-1:] = sma_valid
+
+    return sma_arr
 
 
-def update_sma(df, window, name):
-    """
-    df の最後の行のみ、直近 window 本の 'close' 値から SMA を計算し、name カラムを更新する。
-    """
-    # もしデータ数が window 未満なら、全体平均を計算
-    df = df.copy()  # コピーを作成
-    if len(df) < window:
-        sma_value = df['close'].mean()
-    else:
-        sma_value = df['close'].iloc[-window:].mean()
-    df.loc[df.index[-1], name] = sma_value
-    return df
+    
 
-def determine_trend(df,name):
+
+
+def determine_trend(sma):
     """
     SMAの時系列データから、前の値と比較して上昇しているかを判定するリストを作成する。
     
@@ -984,266 +796,365 @@ def determine_trend(df,name):
     Returns:
         list: 各インデックスでの上昇(True) or 非上昇(False)のリスト。
     """
+    trend_array = np.empty(sma.shape, dtype = np.float64)
 
-    up_down_list = [False]  # 先頭は比較対象がないのでFalse
-    for i in range(1, len(df)):
-        up_down_list.append(df[name][i] > df[name][i-1])
-    df["UP_DOWN"] = up_down_list
-    return df
+    trend_array[0] = False
+    trend_array[1:] = sma[:-1] < sma[1:]
+    return trend_array
 
-def update_determine_trend(df,name):
-    if df.loc[df.index[-2], name] < df.loc[df.index[-1], name]:
-        df.loc[df.index[-1], "UP_DOWN"] = True
-    elif df.loc[df.index[-2], name] > df.loc[df.index[-1], name]:
-        df.loc[df.index[-1], "UP_DOWN"] = False
-    else:
-        df.loc[df.index[-1], "UP_DOWN"] = None
-    # print(f"最新df:{df.loc[df.index[-1]]}")
-    return df
 
-def detect_pivots(df, name, POINT_THRESHOLD=0.01, LOOKBACK_BARS=15, consecutive_bars=3,arrow_spacing = 10):
+
+def detect_pivots(np_arr, time_df,name,POINT_THRESHOLD,
+                  LOOKBACK_BARS, consecutive_bars,
+                  arrow_spacing):
+
     """
-    25SMAとその上昇/下降情報から、トレンド転換による高値・安値（ピボット）を検出する。
-    連続して上昇／下降したバーの数（consecutive_bars）をパラメーターで設定可能。
+    結合済み np_arr を用いて、SMA の転換点（ピボット）を検出する関数です。
+    結果は各行 (detection_time, pivot_time, pivot_value, pivot_type)
+    として返されます。すべて float64 型の数値（Unixタイムスタンプとしての時刻）です。
     
-    Args:
-        df (DataFrame): 時系列データ。'time', 'close', 'high', 'low', 'sma25'列を含む。
-        up_down_list (list): SMAの上昇/下降を表すブールリスト。
-        point_threshold (float): トレンド転換とみなすためのSMA差の閾値。
-        lookback_bars (int): 過去何本分のデータでチェックするか。
-        consecutive_bars (int): 上昇または下降とみなす連続バーの数（デフォルトは3）。
-        
-    Returns:
-        list: (datetime, price, type) のタプルのリスト。typeは "high" もしくは "low"。
+    入力 np_arr は以下の列構成を前提としています：
+      - 列0: time (Unix タイムスタンプ、float64)
+      - 列2: high
+      - 列3: low
+      - 列-2: SMA (calculate_sma の結果)
+      - 列-1: trend (determine_trend の結果、True->1.0, False->0.0)
+    
+    パラメータ:
+      POINT_THRESHOLD: SMA の変化量の閾値
+      LOOKBACK_BARS: 転換判定のため遡るバー数
+      consecutive_bars: 同一トレンドが連続している必要のあるバー数
+      arrow_spacing: 前回ピボット検出からの最小間隔（バー数）
+    
+    戻り値:
+      検出されたピボット情報を格納した numpy 配列（float64、shape=(n,4)）
+      各行: (detection_time, pivot_time, pivot_value, pivot_type)
+              pivot_type: 1.0=高値ピボット, 0.0=安値ピボット
     """
-    
 
-    last_pivot_index = -999
-    up_trend = False  # 初期は下降トレンドと仮定
-    sma_h_and_l = []
-    prev_h_or_l_index = None
+    if name == "BASE_SMA":
+        wm = WaveManager()
+
+    # np_arr の最後から2列目が SMA、最後の列が trend（1.0 or 0.0）
+    sma = np_arr[:, -2]
+    trend_arr = np_arr[:, -1]
+
     pivot_data = []
-    pivot_index = None
-    minimum_gap = 2
+    last_pivot_index = -arrow_spacing  # 前回検出したピボットのインデックス
+    last_detect_index = 0
+    run_counter = 1                   # 連続する同一トレンドのカウンター
+    n = np_arr.shape[0]
+    # 初期の up_trend 状態は、ここでは False（下降状態）として開始
+    up_trend = False
 
-    up_down_list = df["UP_DOWN"]
+    for i in range(1, n):
+        # 前のバーと同じトレンドなら連続カウンターを増加させ、違えばリセット
+        if trend_arr[i] == trend_arr[i-1]:
+            run_counter += 1
+        else:
+            run_counter = 1
 
-    for i in range(3, len(df)):
-        three_up = (up_down_list[i])
-        three_down = ((not up_down_list[i]))
+        # 連続していないと条件を満たさないのでスキップ
+        if run_counter < consecutive_bars:
+            continue
 
-        # ----- 上昇→下降（高値形成）の検出 -----
-        if three_down and up_trend == True:
-            if last_pivot_index is not None and (i - last_pivot_index) < minimum_gap:
-                continue 
+        # 前回ピボットから十分なバー数が経過しているかチェック
+        if i - last_pivot_index < arrow_spacing:
+            continue
 
-            pivot_index = i
-            last_pivot_index = i
+        # ケース1: 上昇→下降の場合（高値ピボット検出）
+        # ※ up_trend が True（上昇状態）で、trend_arr[i] が 0.0（False、下降へ転じたと仮定）
+        if up_trend and (trend_arr[i] == 0.0):
+            start = max(0, i - LOOKBACK_BARS)
+            window_sma = sma[start: i+1]
+            sma_max = np.nanmax(window_sma)
+            # SMA の変化量が POINT_THRESHOLD 以上なら転換と判断
+            if (sma_max - sma[i]) >= POINT_THRESHOLD:
+                # ここでは、検出した index から LOOKBACK 分さかのぼったウィンドウ内の
+                # 元データの high（列2）の中で、一番高い値を探します。
+                window_high = np_arr[last_pivot_index: i+1, 2]
+                local_high_idx = np.argmax(window_high) + last_pivot_index if last_pivot_index >= 0 else start
+                detection_time = np_arr[i, 0]      # 転換条件が検出された時刻
+                pivot_time = np_arr[local_high_idx, 0]  # ウィンドウ内で最も高い high の時刻
+                pivot_value = np_arr[local_high_idx, 2]  # ウィンドウ内の最高 high 値
+                pivot_type = 1.0  # 高値ピボット
+                pivot_data.append((detection_time, pivot_time, pivot_value, pivot_type))
+                up_trend = False  # 状態反転
+                
+                if name == "BASE_SMA" and i > 150 and n - i > 1500:
+                    wm.add_session(start_index=local_high_idx, start_time_index = i,  prev_index=last_pivot_index, prev_time_index = last_detect_index, up_trend="False")
+                last_pivot_index = local_high_idx
+                last_detect_index = i
+                # if POINT_THRESHOLD == 0.003:
+                #     print(time_df[local_high_idx],time_df[i],pivot_value)
 
-            sma_slice = df[name][pivot_index-LOOKBACK_BARS : pivot_index+1]
-            sma_highest = sma_slice.max()
-            current_sma = df[name][pivot_index]
+        # ケース2: 下降→上昇の場合（安値ピボット検出）
+        # ※ up_trend が False（下降状態）で、trend_arr[i] が 1.0（上昇に転じたと仮定）
+        elif (not up_trend) and (trend_arr[i] == 1.0):
+            start = max(0, i - LOOKBACK_BARS)
+            window = sma[start: i+1]
+            window_min = np.nanmin(window)
+            if (sma[i] - window_min) >= POINT_THRESHOLD:
+                window_min = np_arr[last_pivot_index: i+1, 3]
+                local_min_idx = np.argmin(window_min) + last_pivot_index if last_pivot_index >= 0 else start
+                detection_time = np_arr[i, 0]
+                pivot_time = np_arr[local_min_idx, 0]
+                pivot_value = np_arr[local_min_idx, 3]  # 元データの low（列3）を利用
+                pivot_type = 0.0  # 安値ピボット
+                pivot_data.append((detection_time, pivot_time, pivot_value, pivot_type))
+                up_trend = True  # 状態反転
 
-            if (sma_highest - current_sma) >= POINT_THRESHOLD:
-                sma_highest_index = sma_slice.idxmax()#最高値のindexを入れる
-                # sma_h_and_l.append(sma_highest_index)#sma_h_and_lに最高値のindexを追加
-
-                hs = (df['high'][prev_h_or_l_index : pivot_index+1] 
-                      if prev_h_or_l_index is not None 
-                      else df['high'][pivot_index-LOOKBACK_BARS : pivot_index+1])
-                highest_index = hs.idxmax()
-                highest = hs.max()
-                highest_datetime = df["time"][highest_index]
-                pivot_data.append((highest_datetime, highest, "high"))
-                last_pivot_index = pivot_index
-                up_trend = False
-                prev_h_or_l_index = sma_highest_index
-
-        # ----- 下降→上昇（安値形成）の検出 -----
-        if three_up and up_trend == False:
-            if last_pivot_index is not None and (i - last_pivot_index) < minimum_gap:
-                continue 
-
-            pivot_index = i
-            last_pivot_index = i
-
-            if pivot_index - LOOKBACK_BARS < 0:
-                continue
-
-            sma_slice = df[name][pivot_index-LOOKBACK_BARS : pivot_index+1]
-            sma_lowest = sma_slice.min()
-            current_sma = df[name][pivot_index]
-
-            if current_sma-sma_lowest >= POINT_THRESHOLD:
-                sma_lowest_index = sma_slice.idxmin()
-                # sma_h_and_l.append(sma_lowest_index)
-
-                ls = df['low'][prev_h_or_l_index : pivot_index+1] if prev_h_or_l_index is not None else df['low'][pivot_index-LOOKBACK_BARS : pivot_index+1]
-                lowest_index = ls.idxmin()
-                lowest = ls.min()
-                lowest_datetime = df["time"][lowest_index]
-
-                pivot_data.append((lowest_datetime, lowest, "low"))
-
-                last_pivot_index = pivot_index
-                up_trend = True
-                prev_h_or_l_index = sma_lowest_index
-
-    return pivot_data
-
-
-
-def update_detect_pivot(df, name, point_threshold, lookback_bars, consecutive_bars, arrow_spacing, window=1000):
-    """
-    df の最後 window 行のみを対象にピボット検出を行い、
-    最新のピボットイベントがあれば、元の df の該当行の "Pivot" カラムを更新する。
-    戻り値は検出された最新のピボットイベント（タプル）または None。
-    """
-    # 最新の window 行をコピーして subset_df を作成
-    subset_df = df.iloc[-window:].copy().reset_index(drop=True)
-    # subset_df の UP_DOWN リストを取得
-    up_down_list = subset_df["UP_DOWN"].tolist()
-    # detect_pivots() は (pivot_data, updated_subset_df) を返すので、pivot_data を抽出
+                if name == "BASE_SMA" and i > 150 and n - i > 1500:
+                    wm.add_session(start_index=local_min_idx, start_time_index = i,  prev_index=last_pivot_index, prev_time_index = last_detect_index , up_trend="True")
+                last_pivot_index = local_min_idx
+                last_detect_index = i
+                # if POINT_THRESHOLD == 0.003:
+                #     print(time_df[local_min_idx],time_df[i],pivot_value)
+    # print(len(trend_arr),len(np_arr),len(sma))
     
-    pivots = detect_pivots(subset_df, name, POINT_THRESHOLD=point_threshold, 
-                              LOOKBACK_BARS=lookback_bars, consecutive_bars=consecutive_bars, 
-                              arrow_spacing=arrow_spacing)
-    if pivots:
-        # 最新のピボットイベント
-        last_pivot = pivots[-1]
+    if pivot_data:
+        if name == "BASE_SMA":
+            return wm, np.array(pivot_data, dtype=np.float64)
+        else:
+            return np.array(pivot_data, dtype=np.float64)
+    else:
+        return np.empty((0, 4), dtype=np.float64)
+    
+def merge_arr(base_arr, sml_arr):
+
+    #↓結合したい順に並んでる
+    base_np = base_arr["sma_arr"] #BASE_SMAと元のnp_arrの情報含んでる状態
+    sml_sma_arr = sml_arr["sma_arr"]
+    base_pivot_arr = base_arr["pivot_arr"]
+    sml_pivot_arr = sml_arr["pivot_arr"]
+    # print(base_np)
+    # print(sml_sma_arr.shape)
+    # print(base_pivot_arr.shape)
+    # print(sml_pivot_arr.shape)
+    # print(len(base_np))
+    # print(len(sml_sma_arr))
+    # print(len(base_pivot_arr))
+    # print(len(sml_pivot_arr))
+    # print(base_np.shape)
+    
+    np_arr_with_base_sml_sma = np.column_stack((base_np, sml_sma_arr.reshape(-1, 1)))
+    print(np_arr_with_base_sml_sma.shape)
+    columns = ["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume", "BASE_SMA", "SML_SMA"]
+    df = pd.DataFrame(np_arr_with_base_sml_sma, columns=columns)
+
+    
+
+    # ここで、もともとの time 列は nanosecond 単位になっているので、unit="ns" を指定
+    df["time"] = pd.to_datetime(df["time"], unit="ns", utc=True)
+
+    pivot_columns = ["detection_time", "pivot_time", "pivot_value", "pivot_type"]
+    df_pivot = pd.DataFrame(base_pivot_arr, columns=pivot_columns)
+    df_pivot["detection_time"] = pd.to_datetime(df_pivot["detection_time"], unit="ns", utc=True)
+    df_pivot["pivot_time"] = pd.to_datetime(df_pivot["pivot_time"], unit="ns", utc=True)
+
+    sml_pivot_columns = ["sml_detection_time", "sml_pivot_time", "sml_pivot_value", "sml_pivot_type"]
+    sml_df_pivot = pd.DataFrame(sml_pivot_arr, columns=sml_pivot_columns)
+    sml_df_pivot["sml_detection_time"] = pd.to_datetime(sml_df_pivot["sml_detection_time"], unit="ns", utc=True)
+    sml_df_pivot["sml_pivot_time"] = pd.to_datetime(sml_df_pivot["sml_pivot_time"], unit="ns", utc=True)
+
+    df_sorted = df.sort_values("time")
+    df_pivot_sorted = df_pivot.sort_values("detection_time")
+    sml_df_pivot_sorted = sml_df_pivot.sort_values("sml_detection_time")
+    
+    # まず、df_sorted と df_pivot_sorted を結合
+    merged_temp = pd.merge_asof(df_sorted, df_pivot_sorted,
+                                left_on="time", right_on="detection_time",
+                                direction="nearest", tolerance=pd.Timedelta("3sec"))
+    
+    
+
+    # 次に、merged_temp と sml_df_pivot_sorted を結合
+    merged = pd.merge_asof(merged_temp, sml_df_pivot_sorted,
+                        left_on="time", right_on="sml_detection_time",
+                        direction="nearest", tolerance=pd.Timedelta("3sec"))
+    merged = merged.drop(columns=["real_volume","detection_time", "sml_detection_time"])
+    print("出力完了")
+
+    return merged
+
+
+def pre_data_process(np_arr,conditions,name,time_df):
+    
+    if name == "BASE_SMA":
+        window = conditions.get("BASE_SMA", 20)
+        point_threshold = conditions.get("BASE_threshold", 0)
+        lookback_bars = conditions.get("BASE_lookback", 15)
+        consecutive_bars = conditions.get("BASE_consecutive", 3)
+        arrow_spacing = conditions.get("BASE_arrow_spacing", 8)
+    elif name == "SML_SMA":
+        window = conditions.get("SML_SMA", 4)
+        point_threshold = conditions.get("SML_threshold", 0.002)
+        lookback_bars = conditions.get("SML_lookback", 3)
+        consecutive_bars = conditions.get("SML_consecutive", 1)
+        arrow_spacing = conditions.get("SML_arrow_spacing", 1)
+
+
+
+    sma_arr = calculate_sma(np_arr, window=window)
+    trend_array = determine_trend(sma_arr)
+    np_arr = np.column_stack((np_arr, sma_arr.reshape(-1, 1),trend_array.reshape(-1,1)))
+    
+    if name == "BASE_SMA":
+        wm, pivot_arr = detect_pivots(np_arr,
+                            time_df,name,
+                            POINT_THRESHOLD=point_threshold,
+                            LOOKBACK_BARS=lookback_bars,
+                            consecutive_bars=consecutive_bars,
+                            arrow_spacing=arrow_spacing)
+        np_arr = np_arr[:, :-1]
+        return (name, np_arr, pivot_arr, wm)
+    
+    elif name == "SML_SMA":
+        pivot_arr = detect_pivots(np_arr,
+                            time_df,name,
+                            POINT_THRESHOLD=point_threshold,
+                            LOOKBACK_BARS=lookback_bars,
+                            consecutive_bars=consecutive_bars,
+                            arrow_spacing=arrow_spacing)
+        np_arr = np_arr[:, :-1]
+        return (name, sma_arr, pivot_arr)
         
-        pivot_time, pivot_price, pivot_type = last_pivot
-        # 元の df で pivot_time と一致する行のインデックスを取得
-        idx = df.index[df["time"] == pivot_time]
-        if len(idx) > 0:
-            # "high" なら True、"low" なら False として記録（必要に応じて値を変更してください）
-            df.loc[idx[0], "Pivot"] = True if pivot_type == "high" else False
-        return last_pivot
-    return None
+# グローバルに8つの WaveManager インスタンスを作成
 
 
-def save_pivots_to_csv(pivot_data, filename="pivots.csv"):
-    """
-    ピボット情報をCSV形式で保存する（デバッグ用）。
+def assign_session_to_manager(session):
+    # ラウンドロビン方式などでWaveManagerを選択してセッションを追加する
+    global session_counter
+    manager = wave_managers[session_counter % len(wave_managers)]
+    manager.add_session(session.pivot_data, session.up_trend, session.tp_level, session.stop_loss, session.check_no_SMA)
+    session_counter += 1
+
+def process_data(conditions):
+    global tp_level_global, check_no_SMA_global, range_param_global, stop_loss_global, time_df
+    print("Current working directory:", os.getcwd())
     
-    Args:
-        pivot_data (list): (datetime, price, type)のタプルのリスト。
-        filename (str): 出力ファイル名。
-    """
-    with open(filename, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(["time", "price", "type"])
-        for row in pivot_data:
-            # datetimeはstrftimeできる場合のみ
-            time_str = row[0].strftime('%Y-%m-%d %H:%M') if hasattr(row[0], 'strftime') else row[0]
-            writer.writerow([time_str, row[1], row[2]])
-
-import pytz
+    print(f"テスト開始時間{datetime.now()}")
 
 
+    # conditions からパラメータを取得
+    symbol = conditions.get("symbol", "USDJPY")
+    fromdate = conditions.get("fromdate", datetime(2025, 2, 18, 4, 0))
+    todate = conditions.get("todate", datetime(2025, 2, 20, 6, 50))
+    BASE_SMA = conditions.get("BASE_SMA", 20)
+    BASE_threshold = conditions.get("BASE_threshold", 0.01)
+    BASE_lookback = conditions.get("BASE_lookback", 15)
+    BASE_consecutive = conditions.get("BASE_consecutive", 3)
+    BASE_arrow_spacing = conditions.get("BASE_arrow_spacing", 8)
+    SML_SMA = conditions.get("SML_SMA", 4)
+    SML_threshold = conditions.get("SML_threshold", 0.005)
+    SML_lookback = conditions.get("SML_lookback", 3)
+    SML_consecutive = conditions.get("SML_consecutive", 1)
+    SML_arrow_spacing = conditions.get("SML_arrow_spacing", 1)
+    tp_level_global = conditions.get("tp_level", 138)
+    check_no_SMA_global = conditions.get("check_no_sma", True)
+    output_file = conditions.get("output_file", "trade_logs.csv")
+    # range, stop は将来のための仮パラメータ
+    range_param_global = conditions.get("range", 80)
+    stop_loss_global = conditions.get("stop", "sml")
 
-def process_data(symbol="USDJPY", tp_level=160, output_file="trade_logs.csv"):
-    global last_pivot_data, sml_last_pivot_data, current_price_global, current_df
-
-    pivot_data =[]
-    sml_pivot_data = []
-
-    if not initialize_mt5():
-        return
-    
     print("実行中")
     timezone = pytz.timezone("Etc/UTC")
-    fromdate = datetime(2023, 1, 18, 0, 0, tzinfo=timezone)
-    todate   = datetime(2025, 2, 20, 6, 50, tzinfo=timezone)
 
-    original_df = fetch_data_range(symbol,fromdate, todate)
-    if original_df is None:
-        shutdown_mt5()
-        return
-
-    wm = WaveManager()
-
-    # 1. SMAを計算しSMAの行をdfに追加する
+    df = pd.read_pickle("currency_data/USDJPY_1M.pkl").loc[fromdate:todate].reset_index()
     
-    df = original_df.iloc[:1600].copy()
-    sml_df = original_df.iloc[:1600].copy()
-    
-# 初期のSMA計算（この時点では200本分）
-    df = calculate_sma(df.copy(), window=20, name="BASE_SMA")
-    sml_df = calculate_sma(sml_df.copy(), window=4, name="SML_SMA")
+    time_df = df["time"]
+    np_arr = df.to_numpy(dtype=np.float64)
 
-    determine_trend(df,"BASE_SMA")
-    determine_trend(sml_df,"SML_SMA")
+    base_result = pre_data_process(np_arr, conditions, "BASE_SMA",time_df)
+    sml_result = pre_data_process(np_arr, conditions, "SML_SMA",time_df)
+    results = [base_result,sml_result]
 
-    pivot_data = detect_pivots(df.copy(), POINT_THRESHOLD=0.008, LOOKBACK_BARS=15, name = "BASE_SMA",arrow_spacing=8)
-    sml_pivot_data = detect_pivots(sml_df.copy(), POINT_THRESHOLD=0.001, LOOKBACK_BARS=3,consecutive_bars=1,name="SML_SMA", arrow_spacing=1)
-
-    last_pivot_data = pivot_data[-1]
-    sml_last_pivot_data = sml_pivot_data[-1]
-
-    print(f"開始時間：{df.iloc[-1]["time"]}")
-    
-    for idx in range(1600, len(original_df)):
-
-    # 新しいローソク足データ（1行）を取得
-        new_row = original_df.copy().iloc[idx:idx+1]
-        # DataFrameに追加
-        df = pd.concat([df, new_row], ignore_index=True)
-        sml_df = pd.concat([sml_df, new_row], ignore_index=True)
-        
-        # SMAを再計算（全体のデータに対して計算する場合）
-        df = calculate_sma(df, window=20, name="BASE_SMA")
-        sml_df = calculate_sma(sml_df, window=4, name="SML_SMA")
-        
-        # トレンド判定
-        update_determine_trend(df,"BASE_SMA")
-        update_determine_trend(sml_df,"SML_SMA")
-
-        # 3. 20MAのピボット検出
-        # --- ピボット検出の更新（直近ウィンドウのみ） ---
-        new_pivot = update_detect_pivot(df, point_threshold=0.009, lookback_bars=15, consecutive_bars=3, arrow_spacing=8, name = "BASE_SMA")
-        if new_pivot is not None and new_pivot != last_pivot_data:
-            last_pivot_data = new_pivot
-            pivot_data.append(new_pivot)
-            wm.append_pivot_data(last_pivot_data, df, sml_df)
-            if new_pivot[2] == "high":
-                wm.add_session(pivot_data[-2:], up_trend="False")
-            else:
-                wm.add_session(pivot_data[-2:], up_trend="True")
-
-
-        # 4. 4MAのピボット検出
-        sml_new_pivot = update_detect_pivot(
-            sml_df,
-            point_threshold=0.003,
-            lookback_bars=3,
-            consecutive_bars=1,
-            name="SML_SMA", 
-            arrow_spacing=1
-        )    
-        if sml_new_pivot is not None and sml_new_pivot != sml_last_pivot_data:
-            sml_last_pivot_data = sml_new_pivot
-            sml_pivot_data.append(sml_new_pivot)
-            wm.append_sml_pivot_data(sml_last_pivot_data)
-        
-        # ここでは、過去の十分なデータ（例：直近100行）を含めたウィンドウを送るのではなく、
-        # 最新の1行のみを取り出す場合の例です。
-        if not df.empty:
-            current_df = df.tail(1)
+    result_dict = {}
+    for result in results:
+        # BASE_SMA の場合はタプルの長さが 4 (name, np_arr, pivot_arr, wm)
+        if len(result) == 4:
+            name, arr, pivot_arr, wm = result
+            result_dict[name] = {"sma_arr": arr, "pivot_arr": pivot_arr, "wm": wm}
         else:
-            continue  # 空なら次のループへ
+            name, arr, pivot_arr = result
+            result_dict[name] = {"sma_arr": arr, "pivot_arr": pivot_arr}
+    base_arr = result_dict.get("BASE_SMA")
+    sml_arr = result_dict.get("SML_SMA")
 
-        
-        global current_price_global
-        current_price_global.clear()
-        current_price_global.append(current_df.iloc[-1])
+    wm = base_arr.get("wm")
+    
+    #ここではbase_arrはSMA結合済みの全体のnpとbase_pivot
+    #sml_arrはsmaとpivot単体で入っている
+    #既にどちらもnpとsma結合処理をpre_data_processで行っているため
+    #このような形にすればsmaの結合を1回分削ることができる
 
- 
-        
-        wm.send_candle_data_tosession(df.iloc[-1100:].copy(), sml_df.iloc[-1100:].copy())
-
-    wm.export_trade_logs_to_csv(wm.trade_logs, filename=output_file)
-
+    final_df = merge_arr(base_arr,sml_arr)
+    final_df.to_csv("main_data")
+    wm.full_data = final_df.to_numpy(dtype=np.float64)
+    column_list = final_df.columns.tolist()
+    wm.analyze_sessions()
+    
+    print("処理終了")
+    print(f"終了時間{datetime.now()}")
 
 if __name__ == "__main__":
-    process_data()
+    conditions = {
+        "symbol": "USDJPY",
+        "fromdate": datetime(2025, 2, 18, 0, 0, tzinfo=pytz.UTC), #始まる日時
+        "todate": datetime(2025, 2, 20, 7, 0, tzinfo=pytz.UTC), #終わる日時
+        "BASE_SMA": 20, #BASE_SMAの期間
+        "BASE_threshold": 0.009, #BASE_SMAの閾値
+        "BASE_lookback": 15, #BASE_SMAの遡る期間
+        "BASE_consecutive": 3, #BASE_SMAの上昇下降を判断する連続期間
+        "BASE_arrow_spacing": 8, #BASE_SMAの矢印間隔
+        "SML_SMA": 4, #SML_SMAの期間
+        "SML_threshold": 0.003, #SML_SMAの閾値
+        "SML_lookback": 3, #SML_SMAの遡る期間
+        "SML_consecutive": 1, #SML_SMAの上昇下降を判断する連続期間
+        "SML_arrow_spacing": 2, #SML_SMAの矢印間隔
+        "range" : 80, #一旦無視でいい
+        "stop" : "sml", #一旦無視でいい
+        "tp_level": 138, #利確ライン
+        "check_no_sma" : True, #Trueの場合check_no_smaを実行。Falseの場合は実行しない
+        "output_file": "USDJPY_138_trade_logs.csv" #出力ファイル名
+        
+
+    }
+    process_data(conditions)
+
+
+
+            #     print(f"名前：{self.name}\n"
+        #         f"ここでテスト！セッション名：{self.name}\n"
+        #         f"カレント：{current_df['time']}\n"
+        #         f"開始：{self.start_pivot}\n"
+        #         f"トレンド：{self.up_trend}\n"
+        #         f"ステート：{self.state}\n"
+        #         f"スターと：{self.new_arrow_pivot}\n"
+        #         f"ニューアロー：{self.new_arrow_pivot}\n"
+        #         f"ポテンシャル：{self.potential_neck}\n"
+        #         f"デタマイン：{self.determined_neck}\n"
+        #         f"ベース37：{self.base_fibo37}\n"
+        #         f"ベース70：{self.base_fibo70}\n"
+        #         f"ゴールデンクロス：{self.time_of_goldencross}\n"
+        #         f"スモール：{self.sml_pivot_data}\n"
+        #         f"ゴールデンクロス後のスモール：{self.sml_pivots_after_goldencross}\n"
+
+        # )
+
+
+# 0: time
+# 1: open
+# 2: high
+# 3: low
+# 4: close
+# 5: tick_volume
+# 6: spread
+# 7: BASE_SMA
+# 8: SML_SMA
+# 9: pivot_time
+# 10: pivot_value
+# 11: pivot_type
+# 12: sml_pivot_time
+# 13: sml_pivot_value
+# 14: sml_pivot_type
