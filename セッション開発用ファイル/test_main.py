@@ -71,6 +71,7 @@ class MyModel(object):
         self.destroy_reqest = False
         self.up_trend = True if up_trend == "True" else False
         self.state_times = {}  # 各状態移行時刻
+        self.trade_log = None
 
         # 状態ごとの処理ディスパッチテーブル
         self.state_actions = {
@@ -121,7 +122,7 @@ class MyModel(object):
             self.fibo_minus_20, self.fibo_minus_200, _, _ = detect_extension_reversal(prev_price, start_price, -0.2, -2, None, None)
             judged_price = self.full_data[self.new_arrow_index, 3]
 
-        if watch_price_in_range(self.fibo_minus_20, self.fibo_minus_200, judged_price):
+        if self.watch_price_in_range(self.fibo_minus_20, self.fibo_minus_200, judged_price):
             
             self.create_new_arrow()
             
@@ -155,6 +156,7 @@ class MyModel(object):
         new_arrow_detection_index + 1 から最大200本分の足（required_data）を検証し、
         potential_entry や determined_neck に基づいてエントリー判定を行う。
         """
+        
         start_of_infibos = self.new_arrow_detection_index + 1
         end_of_infibos = self.new_arrow_detection_index + 200
         required_data = self.full_data[start_of_infibos : end_of_infibos]
@@ -168,13 +170,14 @@ class MyModel(object):
                 if self.potential_neck:
                     entry_result = self.potential_entry(required_data, local_index)
                     if entry_result is True:
-                        # import pdb; pdb.set_trace()
+                        
                         self.build_position()
                         break
                     elif entry_result is False:
                         self.potential_neck.clear()
 
                 if self.determined_neck and "has_position" not in self.state:
+                    print("37ライン",self.index_of_fibo37)
                     self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.index_of_fibo37, global_index + 1)
                     for neckline in self.determined_neck[:]:
                         if self.state != 'infibos_has_determined_neck':
@@ -227,9 +230,6 @@ class MyModel(object):
                     self.destroy_reqest = True
                     break
 
-                if 100 < arr[13] < 165:
-                    self.append_sml_pivot_data(required_data, i)
-
     def handle_has_position(self):
         pass
 
@@ -244,41 +244,43 @@ class MyModel(object):
         if self.up_trend:
             prices = (self.full_data[self.start_index, 3], self.full_data[self.new_arrow_index, 2])
             print("プライス達", prices)
+            import pdb; pdb.set_trace()
             self.base_fibo70, _, self.base_fibo37, _ = detect_extension_reversal(prices, lower1_percent=0.3, higher1_percent=-0.37)
         else:
             prices = (self.full_data[self.start_index, 2], self.full_data[self.new_arrow_index, 3])
             self.base_fibo37, _, self.base_fibo70, _ = detect_extension_reversal(prices, lower1_percent=0.37, higher1_percent=-0.3)
 
         self.get_golden_cross_index()
+        
         assert self.index_of_goldencross == 289, f"ゴールデンクロスインデックスが違う。実際は{self.index_of_goldencross}"
         # sml_pivots_after_goldencross を[original_index, detection_index, price, type]で保持
         sml_indices = self.get_pivots_in_range(self.index_of_goldencross, self.new_arrow_detection_index, base_or_sml="sml")
         self.sml_pivots_after_goldencross = np.array([
             [index, #検出したindex
              self.find_detection_index(self.full_data[index, 12], 0),#実際のピボットがあるindex
-             self.full_data[index, 13], #ピボット価格
              self.full_data[index, 14]] #ピボットタイプ
             for index in sml_indices
         ])
-        
         # ※assertのチェックは、必要に応じてshape[0]で確認する
         assert self.sml_pivots_after_goldencross.shape[0] == 2, f"スモールpivotの数が違う。実際は{self.sml_pivots_after_goldencross.shape[0]}"
         highest, lowest = self.get_high_and_low_in_term(self.index_of_goldencross, self.new_arrow_detection_index, False)
         if self.up_trend:
-            if not watch_price_in_range(self.base_fibo37, self.base_fibo70, lowest):
+            if not self.watch_price_in_range(self.base_fibo37, self.base_fibo70, lowest):
+                
                 print(self.start_time_index)
                 self.index_of_fibo37 = self.get_touch37_index()
                 assert self.index_of_fibo37 == 292, f"index_of_goldencrossが違う。実際は{self.index_of_goldencross}"
                 self.touch_37()
                 return
         else:
-            if watch_price_in_range(self.base_fibo37, self.base_fibo70, highest):
+            if self.watch_price_in_range(self.base_fibo37, self.base_fibo70, highest):
                 self.index_of_fibo37 = self.get_touch37_index()
                 self.touch_37()
                 return
 
     def on_enter_infibos(self):
         print("ここだよ")
+        
         self.get_potential_neck_wheninto_newarrow()
 
     def on_enter_has_position(self):
@@ -385,7 +387,7 @@ class MyModel(object):
                         if i + 1 < sml_pvts.shape[0]: #determined作るには最低でも3つピボット必要
                             prices = (sml_pvts[i-1,3], sml_pvts[i,2])
                             fibo32_of_ptl_neck = detect_extension_reversal(prices, -0.32, 0.32, None, None)
-                            if watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], sml_pvts[i+1, 3]):
+                            if self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], sml_pvts[i+1, 3]):
                                 determined_neck = sml_pvts[i]
                         else:
                             potential_neck = sml_pvts[i]
@@ -394,7 +396,7 @@ class MyModel(object):
                         if i + 1 < sml_pvts.shape[0]:
                             prices = (sml_pvts[i-1,2], sml_pvts[i,3])
                             fibo32_of_ptl_neck = detect_extension_reversal(prices, -0.32, 0.32, None, None)
-                            if watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], sml_pvts[i+1, 2]):
+                            if self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], sml_pvts[i+1, 2]):
                                 determined_neck = sml_pvts[i]
                         else:
                             potential_neck = sml_pvts[i]
@@ -424,13 +426,13 @@ class MyModel(object):
             judged_price = sml_pvts[-1][2]
             if self.up_trend:
                 fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level, -0.32, 0.32, None, None)
-                if watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], judged_price):
+                if self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], judged_price):
                     self.determined_neck.append(self.potential_neck[-1])
                     self.potential_neck.clear()
                     self.organize_determined_neck()
             else:
                 fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level, None, None, -0.32, 0.32)
-                if watch_price_in_range(fibo32_of_ptl_neck[2], fibo32_of_ptl_neck[3], judged_price):
+                if self.watch_price_in_range(fibo32_of_ptl_neck[2], fibo32_of_ptl_neck[3], judged_price):
                     self.determined_neck.append(self.potential_neck[-1])
                     self.potential_neck.clear()
                     self.organize_determined_neck()
@@ -464,7 +466,7 @@ class MyModel(object):
                 sml_index_to_get32 = (neck_price, sml_pvts[-2][2])
                 fibo32_of_ptl_neck = detect_extension_reversal(sml_index_to_get32, -0.32, 0.32, None, None)
                 last_highlow = self.get_high_and_low_in_term(self.potential_neck[-1][0], global_index)
-                if watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], last_highlow[1]):
+                if self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], last_highlow[1]):
                     self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.index_of_fibo37, global_index)
                     self.highlow_stop_loss = self.highlow_since_new_arrow[1] - 0.006
                     self.sml_stop_loss = last_highlow[1] - 0.006
@@ -490,7 +492,7 @@ class MyModel(object):
                 sml_index_to_get32 = (neck_price, sml_pvts[-2][2])
                 fibo32_of_ptl_neck = detect_extension_reversal(sml_index_to_get32, None, None, -0.32, 0.32)
                 last_highlow = self.get_high_and_low_in_term(self.potential_neck[-1][0], global_index)
-                if watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], last_highlow[0]):
+                if self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], last_highlow[0]):
                     self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.index_of_fibo37, global_index)
                     self.highlow_stop_loss = self.highlow_since_new_arrow[0] + 0.006
                     self.sml_stop_loss = last_highlow[0] + 0.006
@@ -571,13 +573,13 @@ class MyModel(object):
         else:
             self.destroy_reqest = True
 
-def watch_price_in_range(low, high, judged_price):
-    low = min(low, high)
-    high = max(low, high)
-    if low <= judged_price <= high:
-        return True
-    else:
-        return False
+    def watch_price_in_range(self, low, high, judged_price):
+        low = min(low, high)
+        high = max(low, high)
+        if low <= judged_price <= high:
+            return True
+        else:
+            return False
 
 def check_touch_line(center_price, tested_price):
     if center_price <= tested_price:

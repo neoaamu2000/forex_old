@@ -11,7 +11,7 @@ from test_main import MyModel
 def conditions():
     return {
         "symbol": "USDJPY",
-        "fromdate": datetime(2025, 2, 18, 1, 55, tzinfo=pytz.UTC),
+        "fromdate": datetime(2025, 2, 18, 0, 45, tzinfo=pytz.UTC),
         "todate": datetime(2025, 2, 28, 7, 0, tzinfo=pytz.UTC),
     }
 

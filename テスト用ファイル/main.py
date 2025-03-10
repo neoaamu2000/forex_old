@@ -20,7 +20,6 @@ np.set_printoptions(threshold=np.inf)
 # セッション管理用のグローバル WaveManager インスタンス
 current_price_global = []
 
-
 symbol = "USDJPY"  # デフォルト値
 last_pivot_data = 999
 sml_last_pivot_data = 999
@@ -36,9 +35,8 @@ states = [
 # 遷移定義
 transitions = [
     {"trigger": "create_new_arrow", "source": "created_base_arrow", "dest": "created_new_arrow"},
-    {"trigger": "touch_37", "source": ["created_new_arrow", "infibos_has_determined_neck"], "dest": "infibos"},
-    {"trigger": "neck_determine", "source": "infibos", "dest": "infibos_has_determined_neck"},
-    {"trigger": "build_position", "source": ["infibos", "infibos_has_determined_neck"], "dest": "has_position"},
+    {"trigger": "touch_37", "source": "created_new_arrow", "dest": "infibos"},
+    {"trigger": "build_position", "source": "infibos", "dest": "has_position"},
     {"trigger": "close", "source": "has_position", "dest": "closed"}
 ]
 
@@ -47,461 +45,618 @@ transitions = [
 # セッションクラス（各セッションの状態を管理）
 #############################################
 class MyModel(object):
-    def __init__(self, name, start_index, start_time_index,  prev_index, prev_time_index, up_trend="True"):
-        print(start_index)
+    def __init__(self, name, start_index, start_time_index, prev_index, prev_time_index, up_trend="True"):
         self.name = name
-        self.full_data = []
+        self.start_origin = None
+        self.original_offset = None
+        self.full_data = None
         self.start_index = start_index
+        self.start_time_index = start_time_index
         self.prev_index = prev_index
-        # self.pivot_data = pivot_data[-2:]  # セッション開始時点のピボットデータのコピー
-        # self.start_pivot = pivot_data[-1] if pivot_data else datetime.now()
+        self.prev_time_index = prev_time_index
         self.machine = Machine(model=self, states=states, transitions=transitions, initial="created_base_arrow")
-        self.new_arrow_index = None  # 推進波の終わりの最高（安）値を保管（以降調整波と考える）
+        self.new_arrow_index = None  # 推進波の終わりの最高（安）値
         self.next_new_arrow_index = None
+        
         self.fibo_minus_20 = None
         self.fibo_minus_200 = None
         
-        self.base_fibo37 = []  # 推進波に対する37%リトレースメントライン
-        self.base_fibo70 = [] # 推進波に対する70%リトレースメントライン
-        self.max_neck = []
-        self.time_of_goldencross = []
-        self.highlow_since_new_arrow = []  # 調整波の戻しの深さを把握
-        self.sml_pivot_data = []  # touch20以降のsml_pivotを記録
+        self.base_fibo37 = None  # 37%リトレースメントライン
+        self.base_fibo70 = None  # 70%リトレースメントライン
+        self.index_of_fibo37 = None
+        self.start_of_simulation = None
+        self.final_neckline_index = None
+        self.time_of_goldencross = None
+        self.highlow_since_new_arrow = []  # 調整波の戻しの深さ
+        self.sml_pivot_data = []  # touch20以降のsml_pivot記録
 
         # ネックライン関連
-        self.sml_pivots_after_goldencross = []
-        self.potential_neck = []
+        # ここでは、各ピボットレコードを[original_index, detection_index, price, type]として保持する
+        self.sml_pivots_after_goldencross = np.array([])  
+        self.potential_neck = []  # この中には full_data のインデックス（scalar）を保持
         self.determined_neck = []
 
         self.destroy_reqest = False
-
         self.up_trend = True if up_trend == "True" else False
-
         self.state_times = {}  # 各状態移行時刻
+        self.trade_log = None
 
-        # 最後の2ピボットからフィボナッチラインを設定
-        
-
-        # 状態に応じた処理関数のディスパッチテーブル
+        # 状態ごとの処理ディスパッチテーブル
         self.state_actions = {
             "created_base_arrow": self.handle_created_base_arrow,
             "created_new_arrow": self.handle_created_new_arrow,
             "infibos": self.handle_infibos,
-            "infibos_has_determined_neck": self.handle_infibos_has_determined_neck,
             "has_position": self.handle_has_position,
             "closed": self.handle_closed
         }
 
-
-
+    # np.set_printoptions(threshold=np.inf)
     def execute_state_action(self):
         """現在の状態に対応する処理関数を実行"""
-        while self.destroy_reqest == False:
+        while not self.destroy_reqest:
             action = self.state_actions.get(self.state)
             if action:
+                
                 action()
+        # if self.trade_log is not None and self.trade_log.size > 0:
+        #     print(float(self.trade_log[6]))
 
     def handle_created_base_arrow(self):
+        
         total_len = len(self.full_data)
-        base_pivots_index = self.get_pivots_in_range(self.start_index,total_len-1,base_or_sml="base")
-        indices_after = base_pivots_index[base_pivots_index > self.start_index]
+        base_pivots_index = self.get_pivots_in_range(self.start_time_index + 1, total_len - 1, base_or_sml="base")
+        indices_after = base_pivots_index[base_pivots_index > self.start_time_index]
 
         if indices_after.size >= 2:
-            self.new_arrow_index = indices_after[0]
-            self.next_new_arrow_index = indices_after[1]
+            self.new_arrow_index = self.find_detection_index(self.full_data[indices_after[0], 9], 0)
+            self.new_arrow_detection_index = self.find_detection_index(self.full_data[self.new_arrow_index, 0], 9)
+            self.next_new_arrow_index = self.find_detection_index(self.full_data[indices_after[1], 9], 0)
         else:
+            self.destroy_reqest = True
+            return
+
+        if self.up_trend:
+            prices = (self.full_data[self.prev_index, 2], self.full_data[self.start_index, 3])
+            _, _, self.fibo_minus_20, self.fibo_minus_200 = detect_extension_reversal(prices, None, None, 0.2, 2)
+            judged_price = self.full_data[self.new_arrow_index, 2]
+        else:
+            # if self.name == "Session_3":
+            #     import pdb; pdb.set_trace() 
+            prices = (self.full_data[self.prev_index, 3], self.full_data[self.start_index, 2])
+            self.fibo_minus_20, self.fibo_minus_200, _, _ = detect_extension_reversal(prices, -0.2, -2, None, None)
+            judged_price = self.full_data[self.new_arrow_index, 3]
+
+        if self.watch_price_in_range(self.fibo_minus_20, self.fibo_minus_200, judged_price):
+            self.create_new_arrow()
+            
+        else:
+            self.destroy_reqest = True
+
+
+    def handle_created_new_arrow(self):
+        # on_enterでtouch_37を発動できなかった場合の処理
+        required_data = self.full_data[self.new_arrow_detection_index+1:]
+        
+        while self.state == "created_new_arrow" and not self.destroy_reqest:
+            for i in range(len(required_data)):
+                arr = required_data[i]
+                # もしSMLピボットの条件（例として、arrの13列が特定のレンジにある）を満たすなら、
+                # append_sml_pivot_dataを発動する
+                if 100 < arr[13] < 165:
+                    # if self.name == "Session_7":
+                    #     import pdb; pdb.set_trace()
+                    self.append_sml_pivot_data(required_data, i+1)
+                
+                pre_check = (not check_touch_line(self.base_fibo37, arr[3])
+                            if self.up_trend else
+                            check_touch_line(self.base_fibo37, arr[2]))
+                
+                if pre_check:
+                    if self.price_in_range_while_adjustment(self.new_arrow_detection_index+i+1):
+                        self.index_of_fibo37 = self.new_arrow_detection_index + i + 1
+                        self.start_of_simulation = self.new_arrow_detection_index + i + 1
+                        self.touch_37()
+                        return
+                    else:
+                        self.destroy_reqest = True
+                        break
+                if i == len(required_data) - 1:
+                    self.destroy_reqest = True
+                    
+    def handle_infibos(self):
+        """
+        infibos状態のメインループ：
+        new_arrow_detection_index + 1 から最大200本分の足（required_data）を検証し、
+        potential_entry や determined_neck に基づいてエントリー判定を行う。
+        """
+        # self.start_of_simulation = self.new_arrow_detection_index + 1
+        end_of_infibos = self.start_of_simulation + 200
+        required_data = self.full_data[self.start_of_simulation : end_of_infibos]
+
+        while self.state == "infibos" and self.destroy_reqest == False:
+            for local_index in range(len(required_data)):
+                if self.state != "infibos":
+                    break
+                arr = required_data[local_index]
+                # グローバルインデックス = new_arrow_detection_index+1 + local_index
+                global_index = self.start_of_simulation + local_index
+                
+                if self.potential_neck:
+                    # if global_index == 189:
+                    #     import pdb; pdb.set_trace() 
+                    entry_result = self.potential_entry(required_data, local_index)
+                    if entry_result is True:
+                        self.build_position()
+                        break
+                    elif entry_result is False:
+                        self.potential_neck.clear()
+
+                if self.determined_neck and "has_position" not in self.state:
+                    self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.start_of_simulation, global_index + 1)
+                    for neckline in self.determined_neck[:]:
+                        if self.state != "infibos":
+                            break
+                        if self.up_trend:
+                            neck_price = neckline[2]
+                            if arr[2] > neck_price and neck_price >= arr[7]:
+                                self.highlow_stop_loss = self.highlow_since_new_arrow[1] - 0.006
+                                self.sml_stop_loss = self.sml_pivots_after_goldencross[-1][2] - 0.006
+                                self.final_neckline_index = neckline[1]
+                                prices_data_to_get_take_profit = (self.full_data[self.start_index,3],
+                                                                self.full_data[self.new_arrow_index,2])
+                                highlow = detect_extension_reversal(prices_data_to_get_take_profit, higher1_percent=0.32)
+                                self.take_profit = highlow[2]
+                                self.entry_line = neck_price + 0.006
+                                self.entry_index = global_index
+                                self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
+                                self.point_to_take_profit = abs(self.entry_line - self.take_profit)
+                                self.build_position()
+                                break
+                            elif arr[2] > neck_price and neck_price < arr[7]:
+                                self.determined_neck = [
+                                item for item in self.determined_neck 
+                                if not np.array_equal(item, neckline)
+                            ]
+                        else:
+                            neck_price = neckline[2]
+                            if arr[3] < neck_price and neck_price <= arr[7]:
+                                self.highlow_stop_loss = self.highlow_since_new_arrow[0] + 0.006
+                                self.sml_stop_loss = self.sml_pivots_after_goldencross[-1][2] + 0.006
+                                self.final_neckline_index = neckline[1]
+                                prices_data_to_get_take_profit = (self.full_data[self.start_index,2],
+                                                                self.full_data[self.new_arrow_index,3])
+                                highlow = detect_extension_reversal(prices_data_to_get_take_profit, lower1_percent=0.32)
+                                self.take_profit = highlow[0]
+                                self.entry_line = neck_price - 0.006
+                                self.entry_index = global_index
+                                self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
+                                self.point_to_take_profit = abs(self.entry_line - self.take_profit)
+                                self.build_position()
+                                break
+                            elif arr[3] < neck_price and neck_price > arr[7]:
+                                self.determined_neck = [
+                                item for item in self.determined_neck 
+                                if not np.array_equal(item, neckline)
+                            ]
+                
+                
+
+                if not self.price_in_range_while_adjustment(global_index):
+                    # if self.name == "Session_15":
+                    
+                    self.destroy_reqest = True
+                    break
+                # if self.name == "Session_3" and len(self.sml_pivots_after_goldencross) >2:
+                #     import pdb; pdb.set_trace()
+                if 100 < arr[13] < 165:
+                    self.append_sml_pivot_data(required_data, local_index)
+                    
+                if len(required_data) - local_index == 1:
+                    self.destroy_reqest = True
+                            
+
+    def handle_has_position(self):
+        pass
+
+    def handle_closed(self):
+        if not self.destroy_reqest:
+            self.destroy_reqest = True
+
+    def on_enter_created_new_arrow(self):
+        
+        state_name = self.state
+        self.state_times[state_name] = self.new_arrow_index
+        
+        if self.up_trend:
+            prices = (self.full_data[self.start_index, 3], self.full_data[self.new_arrow_index, 2])
+            
+            self.base_fibo70, _, self.base_fibo37, _ = detect_extension_reversal(prices, lower1_percent=0.3, higher1_percent=-0.37)
+        else:
+            prices = (self.full_data[self.start_index, 2], self.full_data[self.new_arrow_index, 3])
+            self.base_fibo37, _, self.base_fibo70, _ = detect_extension_reversal(prices, lower1_percent=0.37, higher1_percent=-0.3)
+
+        if self.base_fibo37 is None or self.base_fibo70 is None:
             self.destroy_reqest = True
             return
         
         
+        
+        self.get_golden_cross_index()
+        
+        # sml_pivots_after_goldencross を[original_index, detection_index, price, type]で保持
+        sml_indices = self.get_pivots_in_range(self.index_of_goldencross, self.new_arrow_detection_index, base_or_sml="sml")
+        self.sml_pivots_after_goldencross = np.array([
+            [index, actual_index, self.full_data[index, 13], self.full_data[index, 14]]
+            for index in sml_indices
+            if (actual_index := self.find_detection_index(self.full_data[index, 12], 0)) and self.index_of_goldencross < actual_index
+        ])
+
+        
+        highest, lowest = self.get_high_and_low_in_term(self.index_of_goldencross, self.new_arrow_detection_index, False)
+        
         if self.up_trend:
-            print(self.full_data)
-            prev_price, start_price = self.full_data[self.prev_index,2], self.full_data[self.start_index,3]
-            _,_,self.fibo_minus_20,self.fibo_minus_200, = detect_extension_reversal(prev_price, start_price,None, None, 0.2, 2)
-            judged_price = self.full_data[self.new_arrow_index,2]
-        elif not self.up_trend:
-            prev_price, start_price = self.full_data[self.prev_index,3], self.full_data[self.start_index,2]
-            self.fibo_minus_20, self.fibo_minus_200,_,_ = detect_extension_reversal(prev_price, start_price,-0.2,-2,None, None)
-            judged_price = self.full_data[self.new_arrow_index,3]
-
-        if self.watch_price_in_range(self.fibo_minus_20,self.fibo_minus_200,judged_price):
-            self.create_new_arrow()
-        else:
-            self.destroy_reqest == True
-
-
-    def handle_created_new_arrow(self):
-        highest, lowest =self.get_high_and_low_in_term(self.new_arrow_index, self.next_new_arrow_index,False)
-        if self.up_trend is True and self.watch_price_in_range(self.base_fibo37,self.base_fibo70, lowest) is False:
-            self.touch_37()
-        elif self.up_trend is False and self.watch_price_in_range(self.base_fibo37,self.base_fibo70, highest) is True:
-            self.touch_37()
-        else:
-            pass
-
-
-
-    def handle_infibos(self):
-        if self.potential_neck:
-            entry_result = self.potential_entry(df, self.potential_neck)
-            if entry_result is True:
-                self.build_position()
-            elif entry_result is False:
-                self.potential_neck = []
-        elif len(self.determined_neck) > 0:
-            self.neck_determine()
-        self.price_in_range_while_adjustment(df)
-
-    def handle_infibos_has_determined_neck(self):
-        if self.potential_neck:
-            entry_result = self.potential_entry(df, self.potential_neck)
-            if entry_result is True:
-                self.build_position()
-            elif entry_result is False:
-                self.potential_neck = []
-
-        if "has_position" not in self.state:
-            self.highlow_since_new_arrow = self.ml_pivots_after_goldencrom(self.new_arrow_index)
-            if self.up_trend is True:
-                for neckline in self.determined_neck[:]:
-                    if self.state != 'infibos_has_determined_neck':
-                        break
-                    if df.iloc[-1]["high"] > neckline[1] and self.check_no_SMA(df.iloc[-1050:], neckline[1]):
-                        self.stop_loss = self.highlow_since_new_arrow[1] - 0.006
-                        pivots_data_to_get_take_profit = self.start_pivot, self.new_arrow_pivot
-                        highlow = detect_extension_reversal(pivots_data_to_get_take_profit, higher1_percent=0.32)
-                        self.take_profit = highlow[2]
-                        self.entry_line = neckline[1] + 0.002
-                        self.entry_pivot = df.iloc[-1]
-                        self.point_to_take_profit = abs(self.entry_line - self.take_profit)
-                        self.point_to_stoploss = abs(self.entry_line - self.stop_loss)
-                        self.build_position()
-                    elif df.iloc[-1]["high"] > neckline[1] and self.check_no_SMA(df.iloc[-1050:], neckline[1]) is False:
-                        self.determined_neck.remove(neckline)
-                        if not self.determined_neck:
-                            self.touch_37()
+            if self.watch_price_in_range(self.base_fibo37, self.base_fibo70, lowest):
+                self.index_of_fibo37 = self.get_touch37_index()
+                self.start_of_simulation = self.new_arrow_detection_index
+                self.touch_37()
             else:
-                for neckline in self.determined_neck[:]:
-                    if self.state != 'infibos_has_determined_neck':
-                        break
-                    if df.iloc[-1]["low"] < neckline[1] and self.check_no_SMA(df.iloc[-1050:], neckline[1]) is False:
-                        self.stop_loss = self.highlow_since_new_arrow[0] + 0.006
-                        pivots_data_to_get_take_profit = self.start_pivot, self.new_arrow_pivot
-                        highlow = detect_extension_reversal(pivots_data_to_get_take_profit, lower1_percent=-0.32)
-                        self.take_profit = highlow[0]
-                        self.entry_line = neckline[1] - 0.002
-                        self.entry_pivot = df.iloc[-1]
-                        self.point_to_stoploss = abs(self.entry_line - self.stop_loss)
-                        self.point_to_take_profit = abs(self.entry_line - self.take_profit)
-                        self.build_position()
-                    elif df.iloc[-1]["low"] < neckline[1] and self.check_no_SMA(df.iloc[-1050:], neckline[1]) is False:
-                        self.determined_neck.remove(neckline)
-                        if not self.determined_neck:
-                            self.touch_37()
-
-        self.price_in_range_while_adjustment(df)
-
-    def handle_has_position(self, df, sml_df):
-        if self.up_trend is True:
-            if df.iloc[-1]["low"] < self.stop_loss:
-                self.win = False
-                self.result = -1
-                self.close()
-            elif df.iloc[-1]["high"] > self.take_profit:
-                self.win = True
-                self.result = self.point_to_take_profit / self.point_to_stoploss
-                self.close()
+                return
         else:
-            if df.iloc[-1]["high"] > self.stop_loss:
-                self.win = False
-                self.result = -1
-                self.close()
-            elif df.iloc[-1]["low"] < self.take_profit:
-                self.win = True
-                self.result = self.point_to_take_profit / self.point_to_stoploss
-                self.close()
-
-    def handle_closed(self, df, sml_df):
-        self.destroy_reqest = True
-
-    # on_enter 系
-    def record_state_time(self):
-        state_name = self.state
-        self.state_times[state_name] = current_df.iloc[-1]["time"]
-
-    def on_enter_created_new_arrow(self):
-        print("どうだね？",self.state)
-        self.record_state_time()
-        prices = [self.full_data[self.start_index:10],self.full_data[self.new_arrow_index:10]]
-        
-        if self.up_trend is True:
-            self.base_fibo70, _, self.base_fibo37, _ = detect_extension_reversal(prices, lower1_percent=0.3, higher1_percent=-0.37)
-        else:
-            self.base_fibo37, _, self.base_fibo70, _ = detect_extension_reversal(prices, lower1_percent=0.37, higher1_percent=-0.3)
-        self.time_of_goldencross = self.get_golden_cross_time()
-
-        
+            if self.watch_price_in_range(self.base_fibo37, self.base_fibo70, highest):
+                self.index_of_fibo37 = self.get_touch37_index()
+                self.start_of_simulation = self.new_arrow_detection_index
+                self.touch_37()
+                return
+            else:
+                return
 
     def on_enter_infibos(self):
-        self.record_state_time()
+        
         self.get_potential_neck_wheninto_newarrow()
 
     def on_enter_has_position(self):
-        self.record_state_time()
-        print(f"名前：{self.name}, エントリーライン：{self.entry_line}、テイクプロフィット：{self.take_profit}、"
-              f"ストップロス：{self.stop_loss}、エントリーピボット：{self.entry_pivot}、"
-              f"ポイント：{self.point_to_stoploss}、ポイント：{self.point_to_take_profit}、"
-              f"ステート時間：{self.state_times}")
-
+        # print(f"ぽじった,{self.name},{self.start_origin},えんとりー{self.entry_index},{self.entry_line}、ネック{float(self.final_neckline_index)}")
+        self.close()
+        
     def on_enter_closed(self):
-        self.record_state_time()
-        print(f"{self.name}: Entered 'くろーず' state.")
+        global_entry_index = self.original_offset + self.entry_index
+        entry_time = self.full_data[self.entry_index,0]
+        self.trade_log = np.array([entry_time,
+                                self.up_trend,
+                                global_entry_index,
+                                self.entry_line,
+                                self.take_profit,
+                                self.highlow_stop_loss,
+                                self.sml_stop_loss,
+                                self.point_to_stoploss,
+                                self.point_to_take_profit,
+                                ])
+        self.destroy_reqest = True
 
     def __repr__(self):
         return f"MyModel(name={self.name}, state={self.state})"
 
+    #---------------------------------------------------------------------
+    # その他の今後も特に使いそうな機能
+    #---------------------------------------------------------------------
 
+    def find_detection_index(self, target_time, col):
+        """
+        full_dataの指定列からtarget_timeと一致する行のインデックスを返す関数
+        """
+        if isinstance(target_time, np.datetime64):
+            target_time = target_time.astype("int64")
+        indices = np.where(self.full_data[:, col] == target_time)[0]
+        if indices.size > 0:
+            return indices[0]
+        else:
+            return None
+
+    def get_high_and_low_in_term(self, start_index, end_index=None, close=None):
+        start_index = int(start_index)
+        if end_index is not None:
+            end_index = int(end_index)
+            # もしend_indexがstart_indexと同じか、それより小さいなら、1行だけ取得する
+            if end_index <= start_index:
+                end_index = start_index + 1
+            required_data = self.full_data[start_index:end_index]
+            if required_data.size == 0:
+                print(f"空の配列が検出されました。start_index={start_index}, end_index={end_index}")
+        else:
+            required_data = self.full_data[start_index:start_index+1]
         
-
-#---------------------------------------------------------------------
-#その他の今後も特に使いそうな機能
-#---------------------------------------------------------------------
-
-    def get_high_and_low_in_term(self,start_index,end_index,close):
-        """
-        dfから、指定した期間以降の最高値と最安値を検出しreturnする
-        """
-        required_data = self.full_data[start_index:end_index]
-        highest_price = required_data[:,2].max()
-        lowest_price = required_data[:,3].min()
+        highest_price = required_data[:, 2].max()
+        lowest_price = required_data[:, 3].min()
         if close:
-            highest_close = required_data[:,4].max()
-            lowest_close = required_data[:,4].min()
+            highest_close = required_data[:, 4].max()
+            lowest_close = required_data[:, 4].min()
             return highest_price, lowest_price, highest_close, lowest_close
         else:
             return highest_price, lowest_price
 
-    def get_golden_cross_time(self):
-        """
-        dfは過去100本のローソクのデータ(datetime型のtime,open,close,high,low,20MAの値など)
-        sml_dfは過去100本のローソクのデータ(datetime型のtime,open,close,high,low,4MAの値など)
-        基準となるBASE_SMAと一つ下のフラクタル構造のSML_SMAのゴールデンクロスを起こした時間を検出
-        調整波の始まり時間をゴールデンクロス基準で把握し、それ以降の最も深い調整位置を知るためのメソッド。
-        このゴールデンクロスを起こした後にBASE_SMAが調整方向に転換していてtouch37を満たせば
-        調整波として完全に基準を満たしていると判断することができる
-        USDJPY 2/19 13:22付近でのエントリーみたいなのをなくすための措置
-        """
-        
-        base_sma_since_new_arrow = self.full_data[self.new_arrow_index:self.next_new_arrow_index,7]
-        sml_sma_since_new_arrow = self.full_data[self.new_arrow_index:self.next_new_arrow_index,8]
-        
 
+    def get_golden_cross_index(self):
+        base_sma_since_new_arrow = self.full_data[self.new_arrow_index:self.next_new_arrow_index + 1, 7]
+        sml_sma_since_new_arrow = self.full_data[self.new_arrow_index:self.next_new_arrow_index + 1, 8]
         if self.up_trend is True:
             conditions = np.where(base_sma_since_new_arrow > sml_sma_since_new_arrow)
-        elif self.up_trend is False:
+        else:
             conditions = np.where(base_sma_since_new_arrow < sml_sma_since_new_arrow)
-        
         if conditions[0].size > 0:
             self.index_of_goldencross = conditions[0][0] + self.new_arrow_index
         else:
             self.index_of_goldencross = self.new_arrow_index
 
-
-        
-    def check_no_SMA(self,df,neckline):
-        """
-        指定シンボルについて、1分足と5分足の過去 n_bars 本の確定済みデータから、
-        SMA (close) の各期間（25,75,100,150,200）の最新値を計算し、
-        その中で最も低い値と最も高い値を返す。
-        
-        Args:
-            symbol (str): 例 "USDJPY"
-            n_bars (int): 取得するバー数。デフォルトは200
-            
-        Returns:
-            tuple: (lowest_SMA, highest_SMA)
-                もしデータが取得できない場合は None を返す。
-        """
+    def check_no_SMA(self, df, neckline):
         df = df.copy()
         periods = [25, 75, 100, 150, 200, 375, 625, 1000]
         sma_values = []
-            
-        # それぞれの SMA を計算する。ローリング平均は直近の確定足（in-progressの足は含まれない）
         for period in periods:
             if len(df) < period:
-                continue  # 十分なデータがない場合はスキップ
+                continue
             sma_col = f"SMA_{period}"
             df.loc[:, sma_col] = df['close'].rolling(window=period).mean()
-            # dropna() しても良いが、最後の行は十分なデータがあればNaNにならないので、そのまま取得
             sma_value = df[sma_col].iloc[-1]
             sma_values.append(sma_value)
-
-
-
-        if self.up_trend is True and neckline >= max(sma_values):
+        if self.up_trend and neckline >= max(sma_values):
             return True
-        
-        elif self.up_trend is False and neckline <= min(sma_values):
+        elif not self.up_trend and neckline <= min(sma_values):
             return False
-        
         else:
-            return None
-        
+            return None 
 
-
-    def get_pivots_in_range(self,idx1,idx2,base_or_sml):
-        """
-        goldencross以降のsmall_pivotsのデータを取得するメソッド
-        """
-        pivot_arr = self.full_data[idx1:idx2, 10] if base_or_sml == "base" else self.full_data[:, 13]
+    def get_pivots_in_range(self, idx1, idx2, base_or_sml):
+        pivot_arr = self.full_data[idx1:idx2+1, 10] if base_or_sml == "base" else self.full_data[idx1:idx2+1, 13]
         valid = ~np.isnan(pivot_arr)
-        valid_indices = np.where(valid)[0]
-
+        valid_indices = np.where(valid)[0] + idx1
         return valid_indices
 
-    # self.start_index 以降の有効なインデックスだけ抽出して、最初の要素を選ぶ
-        
-
     def get_potential_neck_wheninto_newarrow(self):
-        """
-        ゴールデンクロス以降のsml_pivots(sml_pivots_after_goldencross)を
-        sml_pvtsに格納し、その中にネックラインになりうるpivot(上昇トレンド中の調整のhigh
-        下降トレンド中の調整のlow)があれば、その次のsml_pvtsの戻しの深さ次第で
-        determined_neckに入れる。その価格を超えたらエントリーできる点。
-        ネックラインになりうるpivotの次のpivotが生成されてなければ
-        potential_neckに格納。(この場合次のpivot確定待ち)
-        """
-        print(self.up_trend,self.time_of_goldencross)
+        potential_neck = None
         sml_pvts = self.sml_pivots_after_goldencross
-        if len(sml_pvts) >= 2 and self.up_trend is True:
-            # print(f"名前：{self.name},ステート時間：{self.state_times},ゴールデンクロス：{self.time_of_goldencross}")
-            for i in range(1, len(sml_pvts)):
-                # print(f"名前：{self.name},ステート時間：{self.state_times}")
-                if sml_pvts[i][2] == "high" and sml_pvts[i][0] > self.state_times["infibos"]:
-                    
-                    if i + 1 < len(sml_pvts):
-                        pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
-                        fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,-0.32,0.32,None,None)
-                        if watch_price_in_range(fibo32_of_ptl_neck[0],fibo32_of_ptl_neck[1],sml_pvts[i+1]):
-                            
-                            self.determined_neck.append(sml_pvts[i])
-                            self.organize_determined_neck()
-                    else:
-                        pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
-                        fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,-0.32,0.32,None,None)
-                        self.potential_neck.append(sml_pvts[i])
-
-        if len(sml_pvts) >= 2 and self.up_trend is False:
-            for i in range(1, len(sml_pvts)):
-                if sml_pvts[i][2] == "low" and sml_pvts[i][0] > self.state_times["infibos"]:
-                    if i + 1 < len(sml_pvts):
-                        pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
-                        fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,None,None,-0.32,0.32)
-                        if watch_price_in_range(fibo32_of_ptl_neck[2],fibo32_of_ptl_neck[3],sml_pvts[i+1]):
-                            self.determined_neck.append(sml_pvts[i])
-                            self.organize_determined_neck()
-                    else:
-                        pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
-                        fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,None,None,-0.32,0.32)
-                        self.potential_neck.append(sml_pvts[i])
-
+        determined_neck = None
         
-
+        if sml_pvts.shape[0] >= 2:
+            for i in range(1, sml_pvts.shape[0]):
+                if self.up_trend:
+                    if sml_pvts[i, 3] == 1 and sml_pvts[i, 1] > self.index_of_fibo37:
+                        if i + 1 < sml_pvts.shape[0]: #determined作るには最低でも3つピボット必要
+                            prices = (sml_pvts[i-1,2], sml_pvts[i,2])
+                            fibo32_of_ptl_neck = detect_extension_reversal(prices, -0.32, 0.32, None, None)
+                            if self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], sml_pvts[i+1, 3]):
+                                determined_neck = sml_pvts[i]
+                        else:
+                            potential_neck = sml_pvts[i]
+                else:
+                    if sml_pvts[i, 3] == 0 and sml_pvts[i, 2] > self.index_of_fibo37:
+                        if i + 1 < sml_pvts.shape[0]:
+                            prices = (sml_pvts[i-1,2], sml_pvts[i,2])
+                            fibo32_of_ptl_neck = detect_extension_reversal(prices,None, None,0.32 , -0.32)
+                            if self.watch_price_in_range(fibo32_of_ptl_neck[2], fibo32_of_ptl_neck[3], sml_pvts[i+1, 2]):
+                                determined_neck = sml_pvts[i]
+                        else:
+                            potential_neck = sml_pvts[i]
+                if np.asarray(determined_neck).size > 0:
+                    self.determined_neck.append(determined_neck)
+                    self.organize_determined_neck()
+            if potential_neck is not None:
+                self.potential_neck.append(potential_neck)
+                
     def check_potential_to_determine_neck(self):
-        """
-        self.sml_pivots_after_goldencrossに新しいsml_pivotが追加されてから実行しなければならない関数
-        """
         sml_pvts = self.sml_pivots_after_goldencross
-
+        
         if self.potential_neck:
-            if len(sml_pvts) < 3:
+            # sml_pvtsはNumPy配列で、少なくとも3行必要とする
+            if sml_pvts.shape[0] < 3:
                 self.destroy_reqest = True
                 return None
+            # ここでFibonacci計算に使う2点を取得する
+            # ・sml_pvts[-3, 0]：3つ前のpivotの検出時間（この値をfull_dataの行インデックスとして使い、列13から値を取得）
+            # ・self.potential_neck[-1][1]：potential_neck候補の最新の要素の「ピボットのインデックス」（full_dataの列2から値を取得）
+            pvts_to_get_32level = [
+                sml_pvts[-3, 2],
+                self.potential_neck[-1][2]
+            ]
 
-            pvts_to_get_32level = [sml_pvts[-3], self.potential_neck[-1]]
-
-            if self.up_trend is True:
-
-                fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,-0.32,0.32,None,None)
-                if watch_price_in_range(fibo32_of_ptl_neck[0],fibo32_of_ptl_neck[1],sml_pvts[-1][1]):
+            
+            if self.up_trend:
+                
+                judged_price = sml_pvts[-1][2]
+                fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level, -0.32, 0.32, None, None)
+                result = self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], judged_price)
+                if result:
                     self.determined_neck.append(self.potential_neck[-1])
                     self.potential_neck.clear()
                     self.organize_determined_neck()
-                    
-
-            elif self.up_trend is False:
-                fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,None,None,-0.32,0.32)
-                if watch_price_in_range(fibo32_of_ptl_neck[2],fibo32_of_ptl_neck[3],sml_pvts[-1][1]):
+                else:
+                    self.potential_neck.clear()
+            else:
+                judged_price = sml_pvts[-1][2]
+                fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level, None, None, -0.32, 0.32)
+                result = self.watch_price_in_range(fibo32_of_ptl_neck[2], fibo32_of_ptl_neck[3], judged_price)
+                if result:
                     self.determined_neck.append(self.potential_neck[-1])
                     self.potential_neck.clear()
                     self.organize_determined_neck()
+                else:
+                    self.potential_neck.clear()
 
-    def potential_entry(self, df, neckline):
-        # print(f"ネックライン[-1][1]:{neckline[-1][1]}")
-    # up_trendがTrueの場合
-        if self.up_trend is True:
-            if df.iloc[-1]["high"] > neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:],neckline[-1][1]):
-                self.stop_loss = self.highlow_since_new_arrow[1] - 0.006
-                pivots_data_to_get_take_profit = self.start_pivot, self.new_arrow_pivot
-                highlow = detect_extension_reversal(pivots_data_to_get_take_profit, higher1_percent=0.32)
-                self.take_profit = highlow[2]
-                self.entry_line = neckline[-1][1] + 0.002
-                self.entry_pivot = df.iloc[-1]
-                self.point_to_stoploss = abs(self.entry_line - self.stop_loss)
-                self.point_to_take_profit = abs(self.entry_line - self.take_profit)
-                # print(f"エントリー記録：：：　アプトれ{self.up_trend}, {self.name}、ネック：{neckline}、エントリーライン：{self.entry_line}、エントリーピボット：{self.entry_pivot}, テイクプロフィット：{self.take_profit}")
-                return True
-            elif df.iloc[-1]["high"] > neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:],neckline[-1][1]) is False:
+
+    # necklineは数字で入れる
+    def potential_entry(self, required_data, local_index):
+        """
+        required_data:
+        handle_infibos で切り出した配列（例: self.full_data[self.new_arrow_detection_index+1 : self.new_arrow_detection_index+200]）
+        local_index:
+        required_data 内での行番号 (0,1,2,...)
+        
+        この関数内でグローバルインデックスを計算し、そこでエントリー成立などの処理を行う。
+        """
+        
+        
+        global_index = self.start_of_simulation + local_index
+        
+        arr = required_data[local_index]
+        
+        
+        
+        sml_pvts = self.sml_pivots_after_goldencross
+        if self.potential_neck:
+            if sml_pvts.shape[0] < 2:
+                self.potential_neck.clear()
+                return None
+            
+        neck_price = self.potential_neck[-1][2]
+
+        if self.up_trend:
+            if arr[2] > neck_price and neck_price >= arr[7]:
+                sml_index_to_get32 = (neck_price, sml_pvts[-2][2])
+                fibo32_of_ptl_neck = detect_extension_reversal(sml_index_to_get32, -0.382, 0.382, None, None)
+                last_highlow = self.get_high_and_low_in_term(self.potential_neck[-1][0], global_index)
+                if self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], last_highlow[1]):
+                    self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.index_of_fibo37, global_index+1)
+                    self.highlow_stop_loss = self.highlow_since_new_arrow[1] - 0.006
+                    self.sml_stop_loss = last_highlow[1] - 0.006
+                    self.final_neckline_index = self.potential_neck[-1][1]
+                    prices_data_to_get_take_profit = (self.full_data[self.start_index,3],
+                                                    self.full_data[self.new_arrow_index,2])
+                    highlow = detect_extension_reversal(prices_data_to_get_take_profit, higher1_percent=0.32)
+                    self.take_profit = highlow[2]
+                    self.entry_line = neck_price + 0.006
+                    self.entry_index = global_index
+                    self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
+                    self.point_to_take_profit = abs(self.entry_line - self.take_profit)
+                    return True
+
+            # ネックラインは超えてるが、SMAなどの条件を満たさない場合
+            elif arr[2] > neck_price and neck_price < arr[7]:
                 return False
 
-        # up_trendがFalseの場合
-        if self.up_trend is False:
-            if df.iloc[-1]["low"] < neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:],neckline[-1][1]) is False:
-                self.stop_loss = self.highlow_since_new_arrow[0] + 0.006
-                pivots_data_to_get_take_profit = self.start_pivot, self.new_arrow_pivot
-                highlow = detect_extension_reversal(pivots_data_to_get_take_profit, lower1_percent=-0.32)
-                self.take_profit = highlow[0]
-                self.entry_line = neckline[-1][1] - 0.002
-                self.entry_pivot = df.iloc[-1]
-                self.point_to_stoploss = abs(self.entry_line - self.stop_loss)
-                self.point_to_take_profit = abs(self.entry_line - self.take_profit)
-                # print(f"エントリー記録：：：　アプトれ{self.up_trend}, {self.name}、ネック：{neckline}、エントリーライン：{self.entry_line}、エントリーピボット：{self.entry_pivot}, テイクプロフィット：{self.take_profit}")
-                return True
-            elif df.iloc[-1]["low"] < neckline[-1][1] and self.check_no_SMA(df.iloc[-1050:],neckline[-1][1]) is False:
+        # --- 下降トレンドの場合 ---
+        else:
+            if arr[3] < neck_price and neck_price <= arr[7]:
+                sml_index_to_get32 = (neck_price, sml_pvts[-2][2])
+                fibo32_of_ptl_neck = detect_extension_reversal(sml_index_to_get32, None, None, -0.382, 0.382)
+                last_highlow = self.get_high_and_low_in_term(self.potential_neck[-1][0], global_index)
+                if self.watch_price_in_range(fibo32_of_ptl_neck[2], fibo32_of_ptl_neck[3], last_highlow[0]):
+                    self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.index_of_fibo37, global_index+1)
+                    self.highlow_stop_loss = self.highlow_since_new_arrow[0] + 0.006
+                    self.sml_stop_loss = last_highlow[0] + 0.006
+                    self.final_neckline_index = self.potential_neck[-1][1]
+                    prices_data_to_get_take_profit = (self.full_data[self.start_index,2],
+                                                    self.full_data[self.new_arrow_index,3])
+                    highlow = detect_extension_reversal(prices_data_to_get_take_profit, lower1_percent=0.32)
+                    self.take_profit = highlow[0]
+                    self.entry_line = neck_price - 0.006
+                    self.entry_index = global_index
+                    self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
+                    self.point_to_take_profit = abs(self.entry_line - self.take_profit)
+                    return True
+            elif arr[3] < neck_price and neck_price > arr[7]:
                 return False
 
-        # 条件に該当しない場合は明示的にFalseを返すなど
+        # 条件に当てはまらなければ None
         return None
 
-    def organize_determined_neck(self):
-        result = []
-        # print(f"名前：{self.name},開始:{self.pivot_data},アプトレ{self.up_trend},ポテンシャル{self.determined_neck},デタマインド{self.determined_neck}")
-        # print(f"200ライン：{self.fibo_minus_200}")
-        for item in self.determined_neck:
-        # item[1] が数値であると仮定
-            while result and item[1] > result[-1][1]:
-                result.pop()
-            result.append(item)
-        self.determined_neck = result
 
-    def watch_price_in_range(self,low,high,judged_price):
-        low = min(low, high)
-        high = max(low, high)
-        if low <= judged_price <= high:
+    def append_sml_pivot_data(self, required_data, new_sml_pivot_index):
+        """
+        last_pivot_data更新時に、pivotレコードを追加。
+        ピボットレコードは [original_index, detection_index, pivot_price, type] の4要素。
+        """
+        state_list = ["infibos"]
+        
+        if self.state == "created_new_arrow":
+            actual_index = self.new_arrow_detection_index + new_sml_pivot_index
+        else:
+            actual_index = self.start_of_simulation + new_sml_pivot_index  # 検出したrow
+        row = self.full_data[actual_index]  # キャッシュしてアクセス回数を削減
+        pivot_index = self.find_detection_index(row[12], 0)  # 実際のピボットがあるindex
+        price = row[13]  # ピボット価格
+        type_val = row[14]  # ピボットタイプ
+
+        new_row = np.array([actual_index, pivot_index, price, type_val])
+        
+        # sml_pivots_after_goldencross に対して重複チェック
+        duplicate_in_sml = False
+        if self.sml_pivots_after_goldencross.size != 0:
+            for existing in self.sml_pivots_after_goldencross:
+                if np.array_equal(existing, new_row):
+                    duplicate_in_sml = True
+                    break
+        if not duplicate_in_sml:
+            if self.sml_pivots_after_goldencross.size == 0:
+                self.sml_pivots_after_goldencross = new_row.reshape(1, -1)
+            else:
+                self.sml_pivots_after_goldencross = np.vstack((self.sml_pivots_after_goldencross, new_row))
+        
+        
+        # potential_neck に対しても重複チェック
+        duplicate_in_potential = any(np.array_equal(existing, new_row) for existing in self.potential_neck)
+        if not duplicate_in_potential:
+            if self.state in state_list:
+                if self.potential_neck:
+                    self.check_potential_to_determine_neck()
+                if not self.potential_neck:
+                    if self.up_trend and type_val == 1:
+                        self.potential_neck.append(new_row)
+                    elif (not self.up_trend) and type_val == 0:
+                        self.potential_neck.append(new_row)
+
+
+
+    def organize_determined_neck(self):
+        # None 以外の要素のみで再構成
+        self.determined_neck = [item for item in self.determined_neck if item is not None]
+        result = []
+        if self.up_trend:
+            # 上昇トレンドの場合：価格が大きいものを優先
+            for item in self.determined_neck:
+                while result and item[2] > result[-1][2]:
+                    result.pop()
+                result.append(item)
+        else:
+            # 下降トレンドの場合：価格が小さいものを優先
+            for item in self.determined_neck:
+                while result and item[2] < result[-1][2]:
+                    result.pop()
+                result.append(item)
+        self.determined_neck = result
+        
+    def get_touch37_index(self):
+        
+        required_data = self.full_data[self.index_of_goldencross:]
+        if self.up_trend:
+            required_data = required_data[:, 3]
+            conditions = np.where(required_data < self.base_fibo37)
+        else:
+            required_data = required_data[:, 2]
+            conditions = np.where(required_data > self.base_fibo37)
+        if conditions[0].size > 0:
+            return conditions[0][0] + self.index_of_goldencross
+        else:
+            return None
+
+    def price_in_range_while_adjustment(self, start_index, end_index=None, close=None):
+        
+            
+        if self.up_trend:
+            high = self.full_data[self.new_arrow_index, 2]
+            low = self.base_fibo70
+        else:
+            high = self.base_fibo70
+            low =  self.full_data[self.new_arrow_index, 3]
+        judged_price = self.get_high_and_low_in_term(start_index, end_index, close)
+        if high > judged_price[0] and low < judged_price[1]:
             return True
         else:
-            return False
-
-
-    def price_in_range_while_adjustment(self, df):
-        if self.up_trend:
-            high, low = self.new_arrow_pivot[1], self.base_fibo70
-        else:
-            high, low = self.base_fibo70, self.new_arrow_pivot[1]
-        
-        judged_price = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0])
-        if high < judged_price[0] or low > judged_price[1]:
             self.destroy_reqest = True
+            
+    def watch_price_in_range(self, low, high, judged_price):
+        
+        low_val = min(low, high)
+        high_val = max(low, high)
+        return True if low_val <= judged_price <= high_val else False
         
 
 
@@ -517,16 +672,35 @@ class WaveManager(object):
 
 
     def analyze_sessions(self):
-        
-
         for session_id in list(self.sessions.keys()):
-            session = self.sessions[session_id+30]
-            session.full_data = self.full_data[session.prev_index-100:session.start_index+1500,:]
+            session = self.sessions[session_id]
+            session.start_origin = session.start_index
+            session.full_data = self.full_data[session.prev_index-100:session.start_index+1500, :]
+            difference = session.start_time_index - session.start_index
             session.start_index = session.start_index - session.prev_index + 100
+            session.start_time_index = session.start_index + difference
             session.prev_index = 100
             session.execute_state_action()
-
+            if session.trade_log is not None and session.trade_log.size > 0:
+                self.trade_logs.append(session.trade_log)  # trade_log をリストに追加
             del self.sessions[session_id]
+        # 全セッションの処理が終わったら、リストを NumPy 配列に変換
+        if self.trade_logs:
+            self.trade_logs = np.vstack(self.trade_logs)
+            self.organize_trade_logs()
+            self.trade_logs.to_csv("test_result/usdjpy.csv")
+            print("ログ",self.trade_logs)
+            print(len(self.trade_logs))
+        
+    def organize_trade_logs(self):
+        columns = ["entry_time","up_trend","global_entry_index", "entry_line", "take_profit", "highlow_stop_loss", "sml_stop_loss", "point_to_stoploss", "point_to_take_profit"]
+        time_columns = ["entry_time"]
+        trade_logs = pd.DataFrame(self.trade_logs, columns=columns)
+        time_columns = ["entry_time", "exit_time", "order_time"]  # 変換したい時間カラム名のリスト
+        for col in time_columns:
+            if col in trade_logs.columns:
+                trade_logs[col] = pd.to_datetime(trade_logs[col], unit="ns", utc=True)
+        self.trade_logs = trade_logs
 
 
     def add_session(self, start_index, start_time_index, prev_index, prev_time_index, up_trend):
@@ -535,120 +709,10 @@ class WaveManager(object):
         """
         
         session = MyModel(f"Session_{self.next_session_id}", start_index, start_time_index, prev_index, prev_time_index, up_trend)
+        session.original_offset = prev_index - 100
         self.sessions[self.next_session_id] = session
-        
-        # print(f"New session created: {session}")
         self.next_session_id += 1
         return session
-
-    def append_pivot_data(self, new_pivot_data, df, sml_df):
-        """
-        mainでlast_pivot_dataが更新されたら受け取って各セッションのpivot_dataに追加
-        touched_20の場合推進波の形成が終わったサインとしてcreated_new_arrowに移る
-        "created_base_arrow"の場合touched_20に移る前 (推進波になる前)に波終了でセッション削除
-        """
-        sessions_to_delete = []
-
-        for session_id, session in self.sessions.items():
-            session.pivot_data.append(new_pivot_data)
-
-            if session.state == "touched_20":
-                session.new_arrow_pivot = new_pivot_data
-                session.time_of_goldencross = session.get_golden_cross_time(df, sml_df)
-                session.get_sml_pivots_after_goldencross(session.sml_pivot_data)
-                # if session.name == "Session_2":
-                #     print(f"ここでセッション２テスト！セッション名:{session.name},トレンド：{session.up_trend},開始：{session.start_pivot}、スモール：{session.sml_pivot_data}")
-                #     print("ゴールデンクロス後のぴぼと",session.sml_pivots_after_goldencross)
-                
-                session.create_new_arrow()
-                
-                """
-                stateがtouched_20で矢印が出現ということは推進波が終わり20SMAまで調整方向に
-                傾いている合図。SMAが傾いているころにはsml_smaは間違いなく
-                調整方向へのゴールデンクロス状態。
-                ゴールデンクロスが起きた時からBASE_SMAが調整方向に傾いたと検出されるまでにも
-                調整の一番深い場所やネックラインとなりうるsml_pivotが生成されている可能性もあるので
-                この段階でsml_pivots_after_goldencrossを取得しておく
-                """
-                
-            elif session.state == "created_base_arrow":
-                # print(f"{session_id}:20到達前に新しい矢印形成で削除,{df.iloc[-1]["time"]}")
-                sessions_to_delete.append(session_id)
-        
-        for session_id in sessions_to_delete:
-            # print(f"Session {session_id} deleted due to non trade posibility")
-            # print(f"ステート:{session.state},ポテンシャル：{session.potential_neck},デターミンド：{session.determined_neck}")
-            del self.sessions[session_id]
-            
-
-    def append_sml_pivot_data(self, new_sml_pivot_data):
-        """
-        mainでlast_pivot_dataが更新されたら受け取って各セッションのpivot_dataに追加
-        touched_20の場合推進波の形成が終わったサインとしてcreated_new_arrowに移る
-        "created_base_arrow"の場合touched_20に移る前 (推進波になる前)に波終了でセッション削除
-        """
-        state_list = ["infibos", "infibos_has_determined_neck"]
-        avoid_list = ["created_base_arrow", "has_position", "closed"]
-        for session in self.sessions.values():
-            if session.state not in avoid_list:
-                session.sml_pivot_data.append(new_sml_pivot_data)
-
-            if session.new_arrow_pivot is not None:
-                session.sml_pivots_after_goldencross.append(new_sml_pivot_data)
-
-            if session.state in state_list:
-                if session.potential_neck:
-                    session.check_potential_to_determine_neck()
-                if not session.potential_neck and session.up_trend is True and new_sml_pivot_data[2] == "high":
-                    session.potential_neck.append(new_sml_pivot_data)
-                elif not session.potential_neck and session.up_trend is False and new_sml_pivot_data[2] == "low":
-                    session.potential_neck.append(new_sml_pivot_data)
-            
-        
-
-
-    def send_candle_data_tosession(self,df,sml_df):#dfは直近100件渡されるようになってます
-        """
-        mainからローソク足データが送信された時に各セッションがstate次に進めないか確認
-        """
-        sessions_to_delete = []
-
-        for session_id, session in self.sessions.items():
-            if self.sessions[session_id].state == "closed":
-                self.trade_logs.append(session.entry_pivot)
-                print(f"トレードログテスト：名前：{session.name}{session.entry_pivot}")
-
-            session.execute_state_action(df, sml_df)
-            if session.destroy_reqest is True:
-                sessions_to_delete.append(session_id)
-
-            
-
-        for session_id in sessions_to_delete:
-            del self.sessions[session_id]
-            print(f"Session {session_id} 削除、最終的にちゃんと実行.")
-
-    
-        
-
-
-    def check_in_range(self):
-        avoid_state = "created_base_arrow", "build_position","position_reached161","position_reached200"
-        sessions_to_delete = []
-        for session_id, session in self.sessions.items():
-            if session.state not in avoid_state:
-                if session.up_trend is True:    
-                    result = watch_price_in_range(session.pivot_data[1],session.high150)
-                    if result is False:
-                        sessions_to_delete.append(session_id)
-                        # print(f"{self.name}:check_in_rangeで範囲外で削除")
-                else:
-                    result = watch_price_in_range(session.pivot_data[0],session.low150)
-                    if result is False:
-                        sessions_to_delete.append(session_id)
-                        # print(f"{self.name}:check_in_rangeで範囲外で削除")
-        for session_id in sessions_to_delete:
-            del self.sessions[session_id]
 
     def export_trade_logs_to_csv(trade_logs, filename="trade_logs.csv"):
         import csv
@@ -690,46 +754,34 @@ class WaveManager(object):
         return f"WaveManager(sessions={list(self.sessions.values())})"
 
 
-def detect_extension_reversal(price1,price2,lower1_percent=None, lower2_percent=None, higher1_percent=None, higher2_percent=None):
+def detect_extension_reversal(prices, lower1_percent=None, lower2_percent=None, higher1_percent=None, higher2_percent=None):
     """
-    low1はフィボナッチあてる2点のうち低い方の価格を0として考える。
-    high1はフィボナッチあてる2点のうち高い方の価格を0として考える。
-    例えば150と160のフィボの場合、low1に-0.2を入れると152
-    low2に0.4を入れると154、high1に-0.2を入れると158、high2に0.2を入れると162
-    """    
-    
-    # 前回と直近のピボットの価格を取り出す
-    price1 = price1
-    price2 = price2
-    
-    # 波の低い方と高い方を求める
+    pricesには2つの価格のみを入れる。
+    """
+    price1 = prices[0]
+    price2 = prices[1]
     low_val = min(price1, price2)
     high_val = max(price1, price2)
-    
-    # 波幅の計算
     wave_range = high_val - low_val
-
     if lower1_percent is not None:
         low1 = low_val - (-wave_range * lower1_percent)
     else:
         low1 = None
-
     if higher1_percent is not None:
         high1 = high_val - (-wave_range * higher1_percent)
     else:
-        high1 =None
-
+        high1 = None
     if lower2_percent is not None:
         low2 = low_val - (-wave_range * lower2_percent)
     else:
         low2 = None
-
     if higher2_percent is not None:
         high2 = high_val - (-wave_range * higher2_percent)
     else:
         high2 = None
-    
     return (low1, low2, high1, high2)
+
+
 
 
 def detect_small_reversal(base_p,end_adjustment_p):
@@ -840,12 +892,12 @@ def detect_pivots(np_arr, time_df,name,POINT_THRESHOLD,
     trend_arr = np_arr[:, -1]
 
     pivot_data = []
-    last_pivot_index = -arrow_spacing  # 前回検出したピボットのインデックス
+    last_pivot_index = 0  # 前回検出したピボットのインデックス
     last_detect_index = 0
     run_counter = 1                   # 連続する同一トレンドのカウンター
     n = np_arr.shape[0]
     # 初期の up_trend 状態は、ここでは False（下降状態）として開始
-    up_trend = False
+    up_trend = None
 
     for i in range(1, n):
         # 前のバーと同じトレンドなら連続カウンターを増加させ、違えばリセット
@@ -861,6 +913,14 @@ def detect_pivots(np_arr, time_df,name,POINT_THRESHOLD,
         # 前回ピボットから十分なバー数が経過しているかチェック
         if i - last_pivot_index < arrow_spacing:
             continue
+        
+        if up_trend is None:
+            if trend_arr[i] == 0.0:
+                # もし転換が下降に向かっているなら、これまで上昇していたとみなし
+                up_trend = True
+            elif trend_arr[i] == 1.0:
+                # もし転換が上昇に向かっているなら、これまで下降していたとみなす
+                up_trend = False
 
         # ケース1: 上昇→下降の場合（高値ピボット検出）
         # ※ up_trend が True（上昇状態）で、trend_arr[i] が 0.0（False、下降へ転じたと仮定）
@@ -881,12 +941,10 @@ def detect_pivots(np_arr, time_df,name,POINT_THRESHOLD,
                 pivot_data.append((detection_time, pivot_time, pivot_value, pivot_type))
                 up_trend = False  # 状態反転
                 
-                if name == "BASE_SMA" and i > 150 and n - i > 1500:
+                if name == "BASE_SMA" and last_pivot_index > 150 and n - i > 1500:
                     wm.add_session(start_index=local_high_idx, start_time_index = i,  prev_index=last_pivot_index, prev_time_index = last_detect_index, up_trend="False")
                 last_pivot_index = local_high_idx
                 last_detect_index = i
-                # if POINT_THRESHOLD == 0.003:
-                #     print(time_df[local_high_idx],time_df[i],pivot_value)
 
         # ケース2: 下降→上昇の場合（安値ピボット検出）
         # ※ up_trend が False（下降状態）で、trend_arr[i] が 1.0（上昇に転じたと仮定）
@@ -904,14 +962,15 @@ def detect_pivots(np_arr, time_df,name,POINT_THRESHOLD,
                 pivot_data.append((detection_time, pivot_time, pivot_value, pivot_type))
                 up_trend = True  # 状態反転
 
-                if name == "BASE_SMA" and i > 150 and n - i > 1500:
+                if name == "BASE_SMA" and  last_pivot_index > 100 and n - i > 1500:
                     wm.add_session(start_index=local_min_idx, start_time_index = i,  prev_index=last_pivot_index, prev_time_index = last_detect_index , up_trend="True")
+                #     print(local_min_idx)
                 last_pivot_index = local_min_idx
                 last_detect_index = i
                 # if POINT_THRESHOLD == 0.003:
                 #     print(time_df[local_min_idx],time_df[i],pivot_value)
     # print(len(trend_arr),len(np_arr),len(sma))
-    
+    # 
     if pivot_data:
         if name == "BASE_SMA":
             return wm, np.array(pivot_data, dtype=np.float64)
@@ -938,7 +997,6 @@ def merge_arr(base_arr, sml_arr):
     # print(base_np.shape)
     
     np_arr_with_base_sml_sma = np.column_stack((base_np, sml_sma_arr.reshape(-1, 1)))
-    print(np_arr_with_base_sml_sma.shape)
     columns = ["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume", "BASE_SMA", "SML_SMA"]
     df = pd.DataFrame(np_arr_with_base_sml_sma, columns=columns)
 
@@ -964,14 +1022,14 @@ def merge_arr(base_arr, sml_arr):
     # まず、df_sorted と df_pivot_sorted を結合
     merged_temp = pd.merge_asof(df_sorted, df_pivot_sorted,
                                 left_on="time", right_on="detection_time",
-                                direction="nearest", tolerance=pd.Timedelta("3sec"))
+                                direction="nearest", tolerance=pd.Timedelta("2sec"))
     
     
 
     # 次に、merged_temp と sml_df_pivot_sorted を結合
     merged = pd.merge_asof(merged_temp, sml_df_pivot_sorted,
                         left_on="time", right_on="sml_detection_time",
-                        direction="nearest", tolerance=pd.Timedelta("3sec"))
+                        direction="nearest", tolerance=pd.Timedelta("2sec"))
     merged = merged.drop(columns=["real_volume","detection_time", "sml_detection_time"])
     print("出力完了")
 
@@ -1022,12 +1080,12 @@ def pre_data_process(np_arr,conditions,name,time_df):
 # グローバルに8つの WaveManager インスタンスを作成
 
 
-def assign_session_to_manager(session):
-    # ラウンドロビン方式などでWaveManagerを選択してセッションを追加する
-    global session_counter
-    manager = wave_managers[session_counter % len(wave_managers)]
-    manager.add_session(session.pivot_data, session.up_trend, session.tp_level, session.stop_loss, session.check_no_SMA)
-    session_counter += 1
+# def assign_session_to_manager(session):
+#     # ラウンドロビン方式などでWaveManagerを選択してセッションを追加する
+#     global session_counter
+#     manager = wave_managers[session_counter % len(wave_managers)]
+#     manager.add_session(session.pivot_data, session.up_trend, session.tp_level, session.stop_loss, session.check_no_SMA)
+#     session_counter += 1
 
 def process_data(conditions):
     global tp_level_global, check_no_SMA_global, range_param_global, stop_loss_global, time_df
@@ -1038,7 +1096,7 @@ def process_data(conditions):
 
     # conditions からパラメータを取得
     symbol = conditions.get("symbol", "USDJPY")
-    fromdate = conditions.get("fromdate", datetime(2025, 2, 18, 4, 0))
+    fromdate = conditions.get("fromdate", datetime(2024, 2, 17, 20, 0))
     todate = conditions.get("todate", datetime(2025, 2, 20, 6, 50))
     BASE_SMA = conditions.get("BASE_SMA", 20)
     BASE_threshold = conditions.get("BASE_threshold", 0.01)
@@ -1082,7 +1140,8 @@ def process_data(conditions):
     sml_arr = result_dict.get("SML_SMA")
 
     wm = base_arr.get("wm")
-    
+    # for session in wm.sessions.values():
+    #     print(session.name, session.start_index, session.start_time_index, session.prev_index, session.up_trend)
     #ここではbase_arrはSMA結合済みの全体のnpとbase_pivot
     #sml_arrはsmaとpivot単体で入っている
     #既にどちらもnpとsma結合処理をpre_data_processで行っているため
@@ -1100,8 +1159,8 @@ def process_data(conditions):
 if __name__ == "__main__":
     conditions = {
         "symbol": "USDJPY",
-        "fromdate": datetime(2025, 2, 18, 0, 0, tzinfo=pytz.UTC), #始まる日時
-        "todate": datetime(2025, 2, 20, 7, 0, tzinfo=pytz.UTC), #終わる日時
+        "fromdate": datetime(2024, 11, 17, 0, 0, tzinfo=pytz.UTC), #始まる日時
+        "todate": datetime(2025, 2, 19, 18, 0, tzinfo=pytz.UTC), #終わる日時
         "BASE_SMA": 20, #BASE_SMAの期間
         "BASE_threshold": 0.009, #BASE_SMAの閾値
         "BASE_lookback": 15, #BASE_SMAの遡る期間
@@ -1120,7 +1179,13 @@ if __name__ == "__main__":
         
 
     }
+    start = time.time()
     process_data(conditions)
+    
+    end = time.time()  # 現在時刻（処理完了後）を取得
+
+    time_diff = end - start  # 処理完了後の時刻から処理開始前の時刻を減算する
+    print(time_diff)  # 処理にかかった時間データを使用
 
 
 
