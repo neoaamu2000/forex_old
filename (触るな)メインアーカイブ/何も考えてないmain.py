@@ -1149,7 +1149,7 @@ def process_data(symbol="EURJPY", tp_level=160, output_file="EURJPYtrade_logs.cs
     
     print("実行中")
     timezone = pytz.timezone("Etc/UTC")
-    fromdate = datetime(2025, 1, 5, 0, 0, tzinfo=timezone)
+    fromdate = datetime(2025, 2, 10, 0, 0, tzinfo=timezone)
     todate   = datetime(2025, 2, 20, 6, 50, tzinfo=timezone)
 
     original_df = fetch_data_range(symbol,fromdate, todate)
