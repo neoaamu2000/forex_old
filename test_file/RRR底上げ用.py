@@ -27,7 +27,7 @@ sml_last_pivot_data = 999
 states = [
     "created_base_arrow",
     "created_new_arrow",
-    {"name": "infibos", "children": "has_determined_neck", 'initial': False},
+    "infibos",
     "has_position",
     "closed"
 ]
@@ -152,6 +152,12 @@ class MyModel(object):
                     self.destroy_reqest = True
 
     def handle_infibos(self):
+        """
+        infibos状態のメインループ：
+        new_arrow_detection_index 以降から最大200本分の足（required_data）を検証し、
+        potential_entry や determined_neck に基づいてエントリー判定を行う。
+        エントリー時、リスクリワード比率が2以下の場合はエントリーせず候補を削除する。
+        """
         end_of_infibos = self.start_of_simulation + 200
         required_data = self.full_data[self.start_of_simulation : end_of_infibos]
         while self.state == "infibos" and not self.destroy_reqest:
@@ -162,15 +168,22 @@ class MyModel(object):
                     self.destroy_reqest = True
                 if self.state != "infibos" or self.destroy_reqest:
                     break
+
+                # potential_neck をもとにエントリー判定
                 if self.potential_neck:
                     entry_result = self.potential_entry(required_data, local_index)
                     if entry_result is True:
                         self.build_position()
                         break
                     elif entry_result is False:
-                        self.potential_neck.clear()
+                        # 候補削除前に、リストが空でないか確認してから pop で削除
+                        if self.potential_neck:
+                            self.potential_neck.pop()
+                
+                # determined_neck に対してエントリー条件のチェックを実施
                 if self.determined_neck and "has_position" not in self.state:
                     self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.start_of_simulation, global_index + 1)
+                    # 現在の determined_neck のコピーでループ
                     for neckline in self.determined_neck[:]:
                         if self.state != "infibos":
                             break
@@ -180,21 +193,30 @@ class MyModel(object):
                                 self.highlow_stop_loss = self.highlow_since_new_arrow[1] - 0.006
                                 self.sml_stop_loss = self.sml_pivots_after_goldencross[-1][2] - 0.006
                                 self.final_neckline_index = neckline[1]
-                                prices_data_to_get_take_profit = (self.full_data[self.start_index,3],
-                                                                   self.full_data[self.new_arrow_index,2])
-                                highlow = detect_extension_reversal(prices_data_to_get_take_profit, higher1_percent=0.33)
+                                prices_data_to_get_take_profit = (
+                                    #self.full_data[self.start_index, 3],
+                                    self.full_data[self.new_arrow_index, 2],
+                                    self.highlow_since_new_arrow[1]
+                                )
+                                highlow = detect_extension_reversal(prices_data_to_get_take_profit, higher1_percent=0.9)
                                 self.take_profit = highlow[2]
                                 self.entry_line = neck_price + 0.006
                                 self.entry_index = global_index
                                 self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
                                 self.point_to_take_profit = abs(self.entry_line - self.take_profit)
-                                print(f"アプトレ：{self.up_trend},エントリー：{self.entry_line}、TP：{self.take_profit}")
-                                self.build_position() 
-                                break
+                                # リスクリワード比率が2以下なら候補を削除（np.array_equal を利用）
+                                if (self.point_to_take_profit / self.point_to_stoploss) <= 1.2:
+                                    self.determined_neck = [
+                                        n for n in self.determined_neck
+                                        if not np.array_equal(n, neckline)
+                                    ]
+                                else:
+                                    self.build_position()
+                                    break
                             elif arr[2] > neck_price and not self.check_no_SMA(global_index, neck_price):
                                 self.determined_neck = [
-                                    item for item in self.determined_neck 
-                                    if not np.array_equal(item, neckline)
+                                    n for n in self.determined_neck
+                                    if not np.array_equal(n, neckline)
                                 ]
                         else:
                             neck_price = neckline[2]
@@ -202,20 +224,29 @@ class MyModel(object):
                                 self.highlow_stop_loss = self.highlow_since_new_arrow[0] + 0.006
                                 self.sml_stop_loss = self.sml_pivots_after_goldencross[-1][2] + 0.006
                                 self.final_neckline_index = neckline[1]
-                                prices_data_to_get_take_profit = (self.full_data[self.start_index,2],
-                                                                   self.full_data[self.new_arrow_index,3])
-                                highlow = detect_extension_reversal(prices_data_to_get_take_profit, lower1_percent=-0.33)
+                                prices_data_to_get_take_profit = (
+                                    #self.full_data[self.start_index, 2],
+                                    self.full_data[self.new_arrow_index,3],
+                                    self.highlow_since_new_arrow[0]
+                                )
+                                highlow = detect_extension_reversal(prices_data_to_get_take_profit, lower1_percent=-0.9)
                                 self.take_profit = highlow[0]
                                 self.entry_line = neck_price - 0.006
                                 self.entry_index = global_index
-                                print(f"アプトレ：{self.up_trend},エントリー：{self.entry_line}、TP：{self.take_profit}")
                                 self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
                                 self.point_to_take_profit = abs(self.entry_line - self.take_profit)
-                                self.build_position()
+                                if (self.point_to_take_profit / self.point_to_stoploss) <= 1.2:
+                                    self.determined_neck = [
+                                        n for n in self.determined_neck
+                                        if not np.array_equal(n, neckline)
+                                    ]
+                                else:
+                                    self.build_position()
+                                    break
                             elif arr[3] < neck_price and not self.check_no_SMA(global_index, neck_price):
                                 self.determined_neck = [
-                                    item for item in self.determined_neck 
-                                    if not np.array_equal(item, neckline)
+                                    n for n in self.determined_neck
+                                    if not np.array_equal(n, neckline)
                                 ]
                 if not self.price_in_range_while_adjustment(global_index):
                     self.destroy_reqest = True
@@ -414,62 +445,108 @@ class MyModel(object):
                     self.potential_neck.clear()
 
     def potential_entry(self, required_data, local_index):
+        """
+        potential_entry のロジック（ポテンシャルエントリー候補からエントリー判定）
+        
+        ・潜在的なネックライン候補（potential_neck）があるかチェック
+        ・エントリー時の条件（価格、SMAチェック、リトレースメントラインの範囲内）を確認
+        ・エントリー前にリスクリワード比（point_to_take_profit / point_to_stoploss）が2以上であるかチェックする
+        ※ 2未満なら候補を削除してエントリーしない
+        """
+        # potential_neckが空ならすぐにNoneを返す
+        if not self.potential_neck:
+            return None
+
         global_index = self.start_of_simulation + local_index
         arr = required_data[local_index]
         sml_pvts = self.sml_pivots_after_goldencross
-        if self.potential_neck:
-            if sml_pvts.shape[0] < 2:
-                self.potential_neck.clear()
-                return None
+
+        # sml_pvtsのサイズが2未満なら、potential_neckをクリアして終了
+        if sml_pvts.shape[0] < 2:
+            self.potential_neck.clear()
+            return None
+
+        # 再度、potential_neckが空になっていないかチェック
+        if not self.potential_neck:
+            return None
+
+        # potential_neckの最後の要素のネック価格を取得
         neck_price = self.potential_neck[-1][2]
+
         if self.up_trend:
+            # 上昇トレンドの場合の処理
             if arr[2] > neck_price and self.check_no_SMA(global_index, neck_price):
+                # sml_pvtsのサイズが2未満でないか再チェック
+                if sml_pvts.shape[0] < 2:
+                    return None
                 sml_index_to_get32 = (neck_price, sml_pvts[-2][2])
                 fibo32_of_ptl_neck = detect_extension_reversal(sml_index_to_get32, -0.382, 0.382, None, None)
                 last_highlow = self.get_high_and_low_in_term(self.potential_neck[-1][0], global_index)
                 if self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], last_highlow[1]):
-                    self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.index_of_fibo37, global_index+1)
+                    # エントリーラインおよびストップロス／テイクプロフィットの計算
+                    self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.index_of_fibo37, global_index + 1)
                     self.highlow_stop_loss = self.highlow_since_new_arrow[1] - 0.006
                     self.sml_stop_loss = last_highlow[1] - 0.006
                     self.final_neckline_index = self.potential_neck[-1][1]
-                    prices_data_to_get_take_profit = (self.full_data[self.start_index,3],
-                                                       self.full_data[self.new_arrow_index,2])
-                    highlow = detect_extension_reversal(prices_data_to_get_take_profit, higher1_percent=0.33)
+                    prices_data_to_get_take_profit = (
+                        # self.full_data[self.start_index, 3],
+                        self.full_data[self.new_arrow_index, 2],
+                        self.highlow_since_new_arrow[1]
+                    )
+                    highlow = detect_extension_reversal(prices_data_to_get_take_profit, higher1_percent=0.9)
                     self.take_profit = highlow[2]
                     self.entry_line = neck_price + 0.006
                     self.entry_index = global_index
                     self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
                     self.point_to_take_profit = abs(self.entry_line - self.take_profit)
-                    return True
+                    # リスクリワード比のチェック：2未満なら候補を削除してFalseを返す
+                    if (self.point_to_take_profit / self.point_to_stoploss) < 1.2:
+                        # リスクリワード比が条件を満たさないので候補削除
+                        self.potential_neck.pop()
+                        return False
+                    else:
+                        return True
             elif arr[2] > neck_price and not self.check_no_SMA(global_index, neck_price):
                 return False
         else:
+            # 下降トレンドの場合の処理
             if arr[3] < neck_price and self.check_no_SMA(global_index, neck_price):
+                if sml_pvts.shape[0] < 2:
+                    return None
                 sml_index_to_get32 = (neck_price, sml_pvts[-2][2])
                 fibo32_of_ptl_neck = detect_extension_reversal(sml_index_to_get32, None, None, -0.382, 0.382)
                 last_highlow = self.get_high_and_low_in_term(self.potential_neck[-1][0], global_index)
                 if self.watch_price_in_range(fibo32_of_ptl_neck[2], fibo32_of_ptl_neck[3], last_highlow[0]):
-                    self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.index_of_fibo37, global_index+1)
+                    self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.index_of_fibo37, global_index + 1)
                     self.highlow_stop_loss = self.highlow_since_new_arrow[0] + 0.006
                     self.sml_stop_loss = last_highlow[0] + 0.006
                     self.final_neckline_index = self.potential_neck[-1][1]
-                    prices_data_to_get_take_profit = (self.full_data[self.start_index,2],
-                                                       self.full_data[self.new_arrow_index,3])
-                    highlow = detect_extension_reversal(prices_data_to_get_take_profit, lower1_percent=-0.33)
+                    prices_data_to_get_take_profit = (
+                        #self.full_data[self.start_index, 2],
+                        self.full_data[self.new_arrow_index, 3],
+                        self.highlow_since_new_arrow[0]
+                    )
+                    highlow = detect_extension_reversal(prices_data_to_get_take_profit, lower1_percent=-0.9)
                     self.take_profit = highlow[0]
                     self.entry_line = neck_price - 0.006
                     self.entry_index = global_index
                     self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
                     self.point_to_take_profit = abs(self.entry_line - self.take_profit)
-                    return True
+                    # リスクリワード比のチェック：2未満なら候補を削除してFalseを返す
+                    if (self.point_to_take_profit / self.point_to_stoploss) < 1.2:
+                        self.potential_neck.pop()
+                        return False
+                    else:
+                        return True
             elif arr[3] < neck_price and not self.check_no_SMA(global_index, neck_price):
                 return False
         return None
 
 
+
     def calculate_trade_result(self, session, data_slice):
         if data_slice.size == 0:
-            # 空の場合の特別処理
+            # データが空の場合の特別処理
             if session.next_next_new_arrow_index and session.next_next_new_arrow_index > 0:
                 exit_price = session.full_data[session.next_next_new_arrow_index - 1, 4]
                 exit_time = session.full_data[session.next_next_new_arrow_index - 1, 0]
@@ -483,39 +560,39 @@ class MyModel(object):
             lows = data_slice[:, 3]
 
             if session.up_trend:
+                # 上昇トレンドの場合
                 tp_hit = highs >= session.take_profit
-                sl_highlow_hit = lows <= session.highlow_stop_loss
-                sl_sml_hit = lows <= session.sml_stop_loss
+                # highlow_stop_loss のみでチェック（下値がstoploss以下になったら損切り）
+                sl_hit = lows <= session.highlow_stop_loss
             else:
+                # 下降トレンドの場合
                 tp_hit = lows <= session.take_profit
-                sl_highlow_hit = highs >= session.highlow_stop_loss
-                sl_sml_hit = highs >= session.sml_stop_loss
+                # highlow_stop_loss のみでチェック（高値がstoploss以上になったら損切り）
+                sl_hit = highs >= session.highlow_stop_loss
 
             tp_index = np.argmax(tp_hit) if np.any(tp_hit) else np.inf
-            sl_highlow_index = np.argmax(sl_highlow_hit) if np.any(sl_highlow_hit) else np.inf
-            sl_sml_index = np.argmax(sl_sml_hit) if np.any(sl_sml_hit) else np.inf
+            sl_index = np.argmax(sl_hit) if np.any(sl_hit) else np.inf
 
-            min_sl_index = min(sl_highlow_index, sl_sml_index)
-            first_event_index = min(tp_index, min_sl_index)
+            # 最初に発生したイベントのインデックスを求める
+            first_event_index = min(tp_index, sl_index)
 
             if first_event_index == np.inf:
+                # どちらの条件も満たさなかった場合は最終バーで強制決済
                 exit_index = len(data_slice) - 1
                 exit_price = data_slice[exit_index, 4]
                 exit_reason = "forced close"
                 result = "forced"
             elif first_event_index == tp_index:
+                # テイクプロフィットが先にヒットした場合
                 exit_index = tp_index
                 exit_price = session.take_profit
                 exit_reason = "T/P"
                 result = "win"
             else:
-                exit_index = min_sl_index
-                if sl_highlow_index < sl_sml_index:
-                    exit_price = session.highlow_stop_loss
-                    exit_reason = "S/L (highlow)"
-                else:
-                    exit_price = session.sml_stop_loss
-                    exit_reason = "S/L (sml)"
+                # ストップロスが先にヒットした場合（ここでは highlow_stop_loss のみ）
+                exit_index = sl_index
+                exit_price = session.highlow_stop_loss
+                exit_reason = "S/L (highlow)"
                 result = "loss"
 
             exit_time = data_slice[exit_index, 0]
@@ -530,7 +607,7 @@ class MyModel(object):
             "exit_price": exit_price,
             "take_profit": session.take_profit,
             "highlow_stop_loss": session.highlow_stop_loss,
-            "sml_stop_loss": session.sml_stop_loss,
+            # sml_stop_loss は今回使用しないため省略
             "exit_reason": exit_reason,
             "result": result,
             "profit_loss": profit_loss,
@@ -538,6 +615,7 @@ class MyModel(object):
         }
 
         return trade_log
+
 
 
 
@@ -629,7 +707,7 @@ class WaveManager(object):
         self.next_session_id = 1
         self.trade_logs = []
         self.full_data = []
-        self.risk_percentage = 10.0
+        self.risk_percentage = 5.0
 
     def analyze_sessions(self):
         for session_id in list(self.sessions.keys()):
@@ -661,7 +739,7 @@ class WaveManager(object):
                                     risk_percentage=self.risk_percentage)
     def organize_trade_logs(self):
         columns = ["entry_time", "up_trend", "start_pivot_time", "global_entry_index", 
-                   "entry_line", "take_profit", "highlow_stop_loss", "sml_stop_loss", 
+                   "entry_line", "take_profit", "highlow_stop_loss",# "sml_stop_loss", 
                    "point_to_stoploss", "point_to_take_profit", "name"]
         trade_logs = pd.DataFrame(self.trade_logs, columns=columns)
         time_columns = ["entry_time", "start_pivot_time", "exit_time", "order_time"]
@@ -670,6 +748,7 @@ class WaveManager(object):
                 trade_logs[col] = pd.to_datetime(trade_logs[col], unit="ns", utc=True, errors='coerce')
         self.trade_logs = trade_logs
 
+    # @profile
     def add_session(self, start_index, start_time_index, prev_index, prev_time_index, up_trend):
         session = MyModel(f"Session_{self.next_session_id}", start_index, start_time_index, prev_index, prev_time_index, up_trend)
         session.original_offset = prev_index - 100
@@ -995,7 +1074,7 @@ def process_data(conditions):
 if __name__ == "__main__":
     conditions = {
         "symbol": "USDJPY",
-        "fromdate": datetime(2018, 1, 20, 0, 0, tzinfo=pytz.UTC),
+        "fromdate": datetime(2025, 1, 2, 0, 0, tzinfo=pytz.UTC),
         "todate": datetime(2025, 2, 20, 18, 0, tzinfo=pytz.UTC),
         "BASE_SMA": 20,
         "BASE_threshold": 0.009,
@@ -1011,7 +1090,7 @@ if __name__ == "__main__":
         "stop": "sml",
         "tp_level": 138,
         "check_no_sma": True,
-        "output_file": "USDJPY_138_trade_logs.csv",
+        "output_file": "USDJPY_138_trade_logs調整.csv",
         "risk_percentage": 3.0  # ここで1回あたりの損失許容額（%）を指定（例：3%）
     }
     start = time.time()

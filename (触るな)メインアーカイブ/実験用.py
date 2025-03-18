@@ -7,9 +7,10 @@ import threading
 from transitions.extensions import HierarchicalMachine as Machine
 import MetaTrader5 as mt5
 import csv
+import threading
 import pandas as pd
 
-
+from login import initialize_mt5, shutdown_mt5
 from transitions.extensions import HierarchicalMachine as Machine
 
 
@@ -19,7 +20,7 @@ current_price_global = []
 
 
 
-symbol="EURJPY"
+symbol="USDJPY"
 
 last_pivot_data = 999
 sml_last_pivot_data = 999
@@ -59,12 +60,13 @@ class MyModel(object):
         self.time_of_goldencross = []
         self.highlow_since_new_arrow = [] #上昇トレンドの調整波の戻しの深さを知るための変数
         self.sml_pivot_data = [] #append_sml_pivot_dataでtouch20以降sml_pivotsを記録
-
+        
 #-------------ネックラインに関する制作-----------------
         self.sml_pivots_after_goldencross = []
         self.potential_neck = []
         self.determined_neck = []
 
+        self.logged = False  # トレードがログ出力されたかどうか
         self.destroy_reqest = False
 
 
@@ -307,7 +309,6 @@ class MyModel(object):
 
     def on_enter_infibos(self):
         self.record_state_time()
-        self.get_potential_neck_wheninto_newarrow()
 
     def on_enter_has_position(self):
         self.record_state_time()
@@ -435,10 +436,10 @@ class MyModel(object):
         """
         sml_pvts = self.sml_pivots_after_goldencross
         if len(sml_pvts) >= 2 and self.up_trend is True:
-
+            
             for i in range(1, len(sml_pvts)):
                 if sml_pvts[i][2] == "high" and sml_pvts[i][0] > self.state_times["infibos"]:
-
+                    
                     if i + 1 < len(sml_pvts):
                         pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
                         fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,-0.32,0.32,None,None)
@@ -447,6 +448,8 @@ class MyModel(object):
                             self.determined_neck.append(sml_pvts[i])
                             self.organize_determined_neck()
                     else:
+                        pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
+                        fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,-0.32,0.32,None,None)
                         self.potential_neck.append(sml_pvts[i])
 
         if len(sml_pvts) >= 2 and self.up_trend is False:
@@ -459,6 +462,8 @@ class MyModel(object):
                             self.determined_neck.append(sml_pvts[i])
                             self.organize_determined_neck()
                     else:
+                        pvts_to_get_32level = [sml_pvts[i],sml_pvts[i-1]]
+                        fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level,None,None,-0.32,0.32)
                         self.potential_neck.append(sml_pvts[i])
 
         
@@ -615,7 +620,7 @@ class WaveManager(object):
                 # if session.name == "Session_2":
                 #     print(f"ここでセッション２テスト！セッション名:{session.name},トレンド：{session.up_trend},開始：{session.start_pivot}、スモール：{session.sml_pivot_data}")
                 #     print("ゴールデンクロス後のぴぼと",session.sml_pivots_after_goldencross)
-                
+                session.get_potential_neck_wheninto_newarrow()
                 session.create_new_arrow()
                 
                 """
@@ -663,27 +668,26 @@ class WaveManager(object):
         
 
 
-    def send_candle_data_tosession(self,df,sml_df):#dfは直近100件渡されるようになってます
-        """
-        mainからローソク足データが送信された時に各セッションがstate次に進めないか確認
-        """
+    def send_candle_data_tosession(self, df, sml_df):
         sessions_to_delete = []
-
         for session_id, session in self.sessions.items():
-            if self.sessions[session_id].state == "closed":
-                self.trade_logs.append(session.entry_pivot)
-                print(f"トレードログテスト：名前：{session.name}{session.entry_pivot}")
-
             session.execute_state_action(df, sml_df)
-            if session.destroy_reqest is True:
+            # セッションが閉じており、かつまだログ出力していない場合のみログを記録する
+            if session.state == "closed" and not session.logged:
+                trade_log = {
+                    "time": session.entry_pivot["time"] if isinstance(session.entry_pivot, dict) else session.entry_pivot,
+                    "price": session.entry_line,
+                    "type": "buy" if session.up_trend else "sell",
+                    "win": session.win,
+                    "result": session.result
+                }
+                self.trade_logs.append(trade_log)
+                session.logged = True  # ログ出力済みにする
+            if session.destroy_reqest:
                 sessions_to_delete.append(session_id)
-
-            
-
         for session_id in sessions_to_delete:
             del self.sessions[session_id]
-            print(f"Session {session_id} 削除、最終的にちゃんと実行.")
-        
+            
             
 
         
@@ -711,26 +715,19 @@ class WaveManager(object):
 
     def export_trade_logs_to_csv(self, filename="trade_logs.csv"):
         import csv
-
         total_trades = len(self.trade_logs)
         wins = sum(1 for trade in self.trade_logs if trade.get("win") is True)
         win_rate = wins / total_trades if total_trades > 0 else 0
-
-        # 勝ち・負けの金額を集計する例（ここでは result が正なら利益、負なら損失と仮定）
         total_profit = sum(trade.get("result", 0) for trade in self.trade_logs if trade.get("result", 0) > 0)
         total_loss = -sum(trade.get("result", 0) for trade in self.trade_logs if trade.get("result", 0) < 0)
         profit_factor = total_profit / total_loss if total_loss > 0 else None
 
         with open(filename, mode="w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
-            # ヘッダ行：各トレードのピボットデータ（datetime, price, type）
-            writer.writerow(["time", "price", "type"])
+            writer.writerow(["time", "price", "type", "win", "result"])
             for trade in self.trade_logs:
-                # trade には例として、{"time": ..., "price": ..., "type": ..., "win": ..., "result": ...} と記録されているとする
                 time_str = trade["time"].strftime("%Y-%m-%d %H:%M:%S") if hasattr(trade["time"], "strftime") else trade["time"]
-                writer.writerow([time_str, trade["price"], trade["type"]])
-            
-            # 空行を入れてからサマリー行を追加
+                writer.writerow([time_str, trade["price"], trade["type"], trade["win"], trade["result"]])
             writer.writerow([])
             writer.writerow(["Total Trades", total_trades])
             writer.writerow(["Wins", wins])
@@ -738,7 +735,6 @@ class WaveManager(object):
             writer.writerow(["Total Profit", total_profit])
             writer.writerow(["Total Loss", total_loss])
             writer.writerow(["Profit Factor", profit_factor])
-        
         print(f"Trade logs exported to {filename}")
 
 
@@ -891,7 +887,7 @@ def check_touch_line(center_price, tested_price):
     elif center_price >= tested_price:
         return False
     
-
+        
 # def check_price_reached(price_to_judge):
 #     """
 #     ネックライン超えたか判断するための関数
@@ -1138,66 +1134,51 @@ import pytz
 
 
 
-def process_data(symbol="EURJPY", tp_level=160, output_file="EURJPYtrade_logs.csv"):
+def process_data(symbol="USDJPY", output_file="trade_logs.csv"):
     global last_pivot_data, sml_last_pivot_data, current_price_global, current_df
 
-    pivot_data =[]
+    pivot_data = []
     sml_pivot_data = []
 
     if not initialize_mt5():
         return
-    
+
     print("実行中")
     timezone = pytz.timezone("Etc/UTC")
-    fromdate = datetime(2025, 2, 16, 0, 0, tzinfo=timezone)
-    todate   = datetime(2025, 2, 18, 6, 50, tzinfo=timezone)
+    fromdate = datetime(2025, 1, 1, 20, 0, tzinfo=timezone)
+    todate   = datetime(2025, 2, 20, 6, 50, tzinfo=timezone)
 
-    original_df = fetch_data_range(symbol,fromdate, todate)
+    original_df = fetch_data_range(symbol, fromdate, todate)
     if original_df is None:
         shutdown_mt5()
         return
 
     wm = WaveManager()
 
-    # 1. SMAを計算しSMAの行をdfに追加する
-    
     df = original_df.iloc[:1600].copy()
     sml_df = original_df.iloc[:1600].copy()
-    
-# 初期のSMA計算（この時点では200本分）
+
     df = calculate_sma(df.copy(), window=20, name="BASE_SMA")
     sml_df = calculate_sma(sml_df.copy(), window=4, name="SML_SMA")
 
-    determine_trend(df,"BASE_SMA")
-    determine_trend(sml_df,"SML_SMA")
+    determine_trend(df, "BASE_SMA")
+    determine_trend(sml_df, "SML_SMA")
 
-    pivot_data = detect_pivots(df.copy(), POINT_THRESHOLD=0.008, LOOKBACK_BARS=15, name = "BASE_SMA",arrow_spacing=8)
-    sml_pivot_data = detect_pivots(sml_df.copy(), POINT_THRESHOLD=0.001, LOOKBACK_BARS=3,consecutive_bars=1,name="SML_SMA", arrow_spacing=1)
-
+    pivot_data = detect_pivots(df, "BASE_SMA", POINT_THRESHOLD=0.008, LOOKBACK_BARS=15, arrow_spacing=8)
+    sml_pivot_data = detect_pivots(sml_df, "SML_SMA", POINT_THRESHOLD=0.001, LOOKBACK_BARS=3, consecutive_bars=1, arrow_spacing=1)
     last_pivot_data = pivot_data[-1]
     sml_last_pivot_data = sml_pivot_data[-1]
+    print(f"開始時間：{df.iloc[-1]['time']}")
 
-    print(f"開始時間：{df.iloc[-1]["time"]}")
-    
     for idx in range(1600, len(original_df)):
-
-    # 新しいローソク足データ（1行）を取得
         new_row = original_df.copy().iloc[idx:idx+1]
-        # DataFrameに追加
         df = pd.concat([df, new_row], ignore_index=True)
         sml_df = pd.concat([sml_df, new_row], ignore_index=True)
-        
-        # SMAを再計算（全体のデータに対して計算する場合）
         df = calculate_sma(df, window=20, name="BASE_SMA")
         sml_df = calculate_sma(sml_df, window=4, name="SML_SMA")
-        
-        # トレンド判定
-        update_determine_trend(df,"BASE_SMA")
-        update_determine_trend(sml_df,"SML_SMA")
-
-        # 3. 20MAのピボット検出
-        # --- ピボット検出の更新（直近ウィンドウのみ） ---
-        new_pivot = update_detect_pivot(df, point_threshold=0.009, lookback_bars=15, consecutive_bars=3, arrow_spacing=8, name = "BASE_SMA")
+        update_determine_trend(df, "BASE_SMA")
+        update_determine_trend(sml_df, "SML_SMA")
+        new_pivot = update_detect_pivot(df, "BASE_SMA", point_threshold=0.009, lookback_bars=15, consecutive_bars=3, arrow_spacing=8)
         if new_pivot is not None and new_pivot != last_pivot_data:
             last_pivot_data = new_pivot
             pivot_data.append(new_pivot)
@@ -1206,39 +1187,27 @@ def process_data(symbol="EURJPY", tp_level=160, output_file="EURJPYtrade_logs.cs
                 wm.add_session(pivot_data[-2:], up_trend="False")
             else:
                 wm.add_session(pivot_data[-2:], up_trend="True")
-
-
-        # 4. 4MAのピボット検出
-        sml_new_pivot = update_detect_pivot(
-            sml_df,
-            point_threshold=0.003,
-            lookback_bars=3,
-            consecutive_bars=1,
-            name="SML_SMA", 
-            arrow_spacing=1
-        )    
+        sml_new_pivot = update_detect_pivot(sml_df, "SML_SMA", point_threshold=0.003, lookback_bars=3, consecutive_bars=1, arrow_spacing=1)
         if sml_new_pivot is not None and sml_new_pivot != sml_last_pivot_data:
             sml_last_pivot_data = sml_new_pivot
             sml_pivot_data.append(sml_new_pivot)
             wm.append_sml_pivot_data(sml_last_pivot_data)
-        
-        # ここでは、過去の十分なデータ（例：直近100行）を含めたウィンドウを送るのではなく、
-        # 最新の1行のみを取り出す場合の例です。
         if not df.empty:
             current_df = df.tail(1)
         else:
-            continue  # 空なら次のループへ
-
-        
-        global current_price_global
+            continue
         current_price_global.clear()
         current_price_global.append(current_df.iloc[-1])
-
- 
-        
         wm.send_candle_data_tosession(df.iloc[-1100:].copy(), sml_df.iloc[-1100:].copy())
+        time.sleep(0.1)
 
-    wm.export_trade_logs_to_csv(filename="EURJPYtrade_logs.csv")
+    # CSV出力：トレードログ
+    wm.export_trade_logs_to_csv(filename=output_file)
+    # CSV出力：Pivotデータ（デバッグ用）
+    save_pivots_to_csv(pivot_data, filename="pivots.csv")
+    print("=== Trade Logs ===")
+    for trade in wm.trade_logs:
+        print(trade)
 
 
 if __name__ == "__main__":
