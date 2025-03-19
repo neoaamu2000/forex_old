@@ -86,10 +86,10 @@ def determine_trend(sma):
 
 
 def calculate_sma(close_prices, window=20):
-    """未来データを含まないSMA計算"""
-    sma = np.full_like(close_prices, np.nan)
-    for i in range(window-1, len(close_prices)):
-        sma[i] = close_prices[i-window+1:i+1].mean()
+    weights = np.ones(window) / window
+    sma_valid = np.convolve(close_prices, weights, mode='valid')
+    sma = np.full_like(close_prices, np.nan, dtype=float)
+    sma[window-1:] = sma_valid
     return sma
 
 def adjust_timestamp(df, timeframe):

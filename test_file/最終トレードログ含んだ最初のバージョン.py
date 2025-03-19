@@ -629,7 +629,7 @@ class WaveManager(object):
         self.next_session_id = 1
         self.trade_logs = []
         self.full_data = []
-        self.risk_percentage = 10.0
+        self.risk_percentage = 1.0
 
     def analyze_sessions(self):
         for session_id in list(self.sessions.keys()):
