@@ -75,13 +75,13 @@ class WaveManager(object):
                 if col in trade_logs_df.columns:
                     trade_logs_df[col] = pd.to_datetime(trade_logs_df[col], unit="ns", utc=True, errors='coerce')
             trade_logs_df.sort_values(by="entry_time", inplace=True)
-            trade_logs_df.to_csv("test_result/usdjpy_check_no_sma搭載1.csv", index=False)
-            print("ログ出力完了", trade_logs_df.head())
-            print(f"ログ数：{len(trade_logs_df)}")
+            # trade_logs_df.to_csv("test_result/usdjpy_check_no_sma搭載1.csv", index=False)
+            # print("ログ出力完了", trade_logs_df.head())
+            # print(f"ログ数：{len(trade_logs_df)}")
             self.trade_logs = trade_logs_df
-            self.summarize_and_export_results(filename=conditions.get("output_file", "final_trade_logs.csv"),
-                                    initial_capital=10000,
-                                    risk_percentage=self.risk_percentage)
+            # self.summarize_and_export_results(filename=conditions.get("output_file", "final_trade_logs.csv"),
+            #                         initial_capital=10000,
+            #                         risk_percentage=self.risk_percentage)
     def organize_trade_logs(self):
         columns = ["entry_time", "up_trend", "start_pivot_time", "global_entry_index", 
                    "entry_line", "take_profit", "highlow_stop_loss",# "sml_stop_loss", 
@@ -383,15 +383,18 @@ def process_data(conditions):
     print("データ整理完了しanalyze_sessions")
     wm.analyze_sessions()
     # risk_percentage を conditions から取得（例：3.0%）
-    risk_percentage = conditions.get("risk_percentage", 3.0)
+    # risk_percentage = conditions.get("risk_percentage", 3.0)
     
-    print("処理終了")
     print(f"終了時間 {datetime.now()}")
+    
+    return wm.trade_logs
+    
+    
 
 if __name__ == "__main__":
     conditions = {
         "symbol": "USDJPY",
-        "fromdate": datetime(2015, 1, 2, 0, 0, tzinfo=pytz.UTC),
+        "fromdate": datetime(2024, 1, 2, 0, 0, tzinfo=pytz.UTC),
         "todate": datetime(2025, 2, 20, 18, 0, tzinfo=pytz.UTC),
         "BASE_SMA": 20,
         "BASE_threshold": 0.009,

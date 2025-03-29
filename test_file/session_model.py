@@ -179,7 +179,7 @@ class MyModel(object):
                                 self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
                                 self.point_to_take_profit = abs(self.entry_line - self.take_profit)
                                 # リスクリワード比率が2以下なら候補を削除（np.array_equal を利用）
-                                if (self.point_to_take_profit / self.point_to_stoploss) <= 1.2:
+                                if (self.point_to_take_profit / self.point_to_stoploss) <= 0.1:
                                     self.determined_neck = [
                                         n for n in self.determined_neck
                                         if not np.array_equal(n, neckline)
@@ -209,7 +209,7 @@ class MyModel(object):
                                 self.entry_index = global_index
                                 self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
                                 self.point_to_take_profit = abs(self.entry_line - self.take_profit)
-                                if (self.point_to_take_profit / self.point_to_stoploss) <= 1.2:
+                                if (self.point_to_take_profit / self.point_to_stoploss) <= 0.1:
                                     self.determined_neck = [
                                         n for n in self.determined_neck
                                         if not np.array_equal(n, neckline)
@@ -285,8 +285,8 @@ class MyModel(object):
         self.set_state("closed")
 
     def on_enter_closed(self):
-        entry_slice = self.full_data[self.entry_index:]
-        self.trade_log = self.calculate_trade_result_fibo_only(entry_slice)
+        # self.trade_log = self.calculate_trade_result_fibo()
+        self.trade_log = self.calculate_trade_result_sml()
         self.destroy_reqest = True
 
     def __repr__(self):
@@ -461,7 +461,7 @@ class MyModel(object):
                     self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
                     self.point_to_take_profit = abs(self.entry_line - self.take_profit)
                     # リスクリワード比のチェック：2未満なら候補を削除してFalseを返す
-                    if (self.point_to_take_profit / self.point_to_stoploss) < 1.2:
+                    if (self.point_to_take_profit / self.point_to_stoploss) < 0.1:
                         # リスクリワード比が条件を満たさないので候補削除
                         self.potential_neck.pop()
                         return False
@@ -494,7 +494,7 @@ class MyModel(object):
                     self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
                     self.point_to_take_profit = abs(self.entry_line - self.take_profit)
                     # リスクリワード比のチェック：2未満なら候補を削除してFalseを返す
-                    if (self.point_to_take_profit / self.point_to_stoploss) < 1.2:
+                    if (self.point_to_take_profit / self.point_to_stoploss) < 0.1:
                         self.potential_neck.pop()
                         return False
                     else:
@@ -505,10 +505,11 @@ class MyModel(object):
 
 
 
-    def calculate_trade_result_fibo_only(self, data_slice):
+    def calculate_trade_result_fibo(self):
         """
         trade_log を計算するメソッド（セッション全体は self で管理）
         """
+        data_slice = self.full_data[self.entry_index:]
         if data_slice.size == 0:
             # データが空の場合の特別処理
             if self.next_next_new_arrow_index and self.next_next_new_arrow_index > 0:
@@ -577,6 +578,86 @@ class MyModel(object):
             "risk_reward_ratio": self.point_to_take_profit / self.point_to_stoploss
         }
 
+        return trade_log
+    
+    def calculate_trade_result_sml(self):
+        """
+        高速なトレード結果判定（SMLピボットベースの決済）
+        ・エントリー後から最初のSMLピボットまでの区間をチェックし、SL条件があれば決済
+        ・その後、各ピボット間の区間で、前のピボットの安値がブレイクされたかをチェック
+        ・最終ピボット以降もチェックし、どれもヒットしなければ最終バーで強制決済
+        """
+        # SMLピボット（安値ピボット）のインデックスを取得
+        pivot_indices = self.get_pivots_in_range(self.entry_index, len(self.full_data)-1, base_or_sml="sml")
+        # typeが0.0（安値ピボット）のものだけを残す
+        pivot_indices = [idx for idx in pivot_indices if self.full_data[idx, 14] == 0.0]
+
+        current_sl = self.highlow_stop_loss
+        entry_price = self.entry_line
+        exit_price, exit_time, exit_reason, result = None, None, None, None
+
+        # ①エントリー後から最初のピボットまでのスライスをチェック
+        if pivot_indices:
+            first_pivot = pivot_indices[0]
+            slice_data = self.full_data[self.entry_index:first_pivot, 3]  # 3: low列
+            if np.any(slice_data <= current_sl):
+                exit_price = current_sl
+                exit_time = self.full_data[self.entry_index + np.argmax(slice_data <= current_sl), 0]
+                exit_reason, result = "S/L", "loss"
+            else:
+                # ②2番目以降のピボットについてチェックする
+                for i in range(len(pivot_indices) - 1):
+                    current_pivot_idx = pivot_indices[i]
+                    next_pivot_idx = pivot_indices[i + 1]
+                    current_pivot_price = self.full_data[current_pivot_idx, 13]  # 13: pivot price
+                    # 現在のピボットと次のピボットの間のlow値を確認
+                    slice_lows = self.full_data[current_pivot_idx:next_pivot_idx, 3]
+                    if np.any(slice_lows <= current_pivot_price):
+                        exit_price = current_pivot_price
+                        exit_time = self.full_data[current_pivot_idx + np.argmax(slice_lows <= current_pivot_price), 0]
+                        exit_reason = "SML pivot break"
+                        # エントリー価格より高ければwin、そうでなければ微損
+                        result = "win" if exit_price > entry_price else "微損"
+                        break
+                else:
+                    # ③最後のピボット以降〜最終バーまでチェック
+                    last_pivot_idx = pivot_indices[-1]
+                    last_pivot_price = self.full_data[last_pivot_idx, 13]
+                    slice_lows = self.full_data[last_pivot_idx:, 3]
+                    if np.any(slice_lows <= last_pivot_price):
+                        exit_price = last_pivot_price
+                        exit_time = self.full_data[last_pivot_idx + np.argmax(slice_lows <= last_pivot_price), 0]
+                        exit_reason = "SML pivot break"
+                        result = "win" if exit_price > entry_price else "微損"
+                    else:
+                        # どの条件もヒットしなければ、最終バーで強制決済
+                        exit_price = self.full_data[-1, 4]  # 4: close列
+                        exit_time = self.full_data[-1, 0]
+                        exit_reason, result = "forced close", "forced"
+        else:
+            # SMLピボットが全くなかった場合はエントリー後から最後までチェック
+            slice_data = self.full_data[self.entry_index:, 3]
+            if np.any(slice_data <= current_sl):
+                exit_price = current_sl
+                exit_time = self.full_data[self.entry_index + np.argmax(slice_data <= current_sl), 0]
+                exit_reason, result = "S/L", "loss"
+            else:
+                exit_price = self.full_data[-1, 4]
+                exit_time = self.full_data[-1, 0]
+                exit_reason, result = "forced close", "forced"
+
+        profit_loss = (exit_price - entry_price) if self.up_trend else (entry_price - exit_price)
+        trade_log = {
+            "entry_time": pd.to_datetime(self.entry_time, unit="ns", utc=True),
+            "up_trend": self.up_trend,
+            "exit_time": pd.to_datetime(exit_time, unit="ns", utc=True),
+            "result": result,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "exit_reason": exit_reason,
+            "profit_loss": profit_loss,
+            "risk_reward_ratio": self.point_to_take_profit / self.point_to_stoploss
+        }
         return trade_log
 
 

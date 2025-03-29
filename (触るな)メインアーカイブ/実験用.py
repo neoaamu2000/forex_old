@@ -148,29 +148,7 @@ class MyModel(object):
         
         self.price_in_range_while_adjustment(df)
 
-    #↓を修正して↑になったけど、↓はエントリー時の戻しの深さの最終チェックに使えるかも
-    # def handle_created_new_arrow(self, df):
-    #     print(f"{self.name}: Handling 'created_new_arrow'")
-    #     self.highlow_since_new_arrow = self.get_high_and_low_in_term(df, self.new_arrow_pivot[0])#推進波の終わり以降の最高（安）値（調整の最も深い価格）を取得
-    #     if self.up_trend is True and check_touch_line(self.base_fibo37, self.highlow_since_new_arrow[1]) is False:
-    #         self.touch_37()
-    #     elif self.up_trend is False and check_touch_line(self.base_fibo37, self.highlow_since_new_arrow[0]) is True:
-    #         self.touch_37()
-    #     else:
-    #         pass
 
-#--------------------ここから------------------------------
-    
-    # def handle_infibos(self, df, sml_df):
-    #     self.price_in_range_while_adjustment(df)
-        
-    #     if self.potential_neck:
-    #         if self.check_potential_entry() is True:
-    #             self.build_position()
-    #         elif self.check_potential_entry() is False:
-    #             self.potential_neck = []
-    #     elif len(self.determined_neck) > 0:
-    #         self.neck_determine()
 
     def handle_infibos(self, df, sml_df):
         if self.potential_neck:
