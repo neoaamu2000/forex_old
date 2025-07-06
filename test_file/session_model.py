@@ -6,9 +6,11 @@ import pandas as pd
 # セッションクラス（各セッションの状態を管理）
 #############################################
 class MyModel(object):
-    def __init__(self, name, start_index, start_time_index, prev_index, prev_time_index, up_trend="True"):
+    def __init__(self, name, start_index, start_time_index, prev_index, prev_time_index, up_trend="True", stop_strategy="sml", tp_level=138):
         self.name = name
         self.state = "created_base_arrow"
+        self.stop_strategy = stop_strategy  # stop戦略を保持
+        self.tp_level = tp_level / 100.0  # tp_levelを割合に変換して保持 (例: 138 -> 1.38)
         self.start_origin = None
         self.start_pivot_time = None
         self.original_offset = None
@@ -88,11 +90,11 @@ class MyModel(object):
 
         if self.up_trend:
             prices = (self.full_data[self.prev_index, 2], self.full_data[self.start_index, 3])
-            _, _, self.fibo_minus_20, self.fibo_minus_200 = detect_extension_reversal(prices, None, None, 0.2, 2)
+            _, _, self.fibo_minus_20, self.fibo_minus_200 = calculate_fibo_levels(prices, None, None, 0.2, 2)
             judged_price = self.full_data[self.new_arrow_index, 2]
         else:
             prices = (self.full_data[self.prev_index, 3], self.full_data[self.start_index, 2])
-            self.fibo_minus_20, self.fibo_minus_200, _, _ = detect_extension_reversal(prices, -0.2, -2, None, None)
+            self.fibo_minus_20, self.fibo_minus_200, _, _ = calculate_fibo_levels(prices, -0.2, -2, None, None)
             judged_price = self.full_data[self.new_arrow_index, 3]
 
         if self.watch_price_in_range(self.fibo_minus_20, self.fibo_minus_200, judged_price):
@@ -168,12 +170,10 @@ class MyModel(object):
                                 self.sml_stop_loss = self.sml_pivots_after_goldencross[-1][2] - 0.006
                                 self.final_neckline_index = neckline[1]
                                 prices_data_to_get_take_profit = (
-                                    #self.full_data[self.start_index, 3],
-                                    self.full_data[self.new_arrow_index, 2],
-                                    self.highlow_since_new_arrow[1]
+                                    self.full_data[self.new_arrow_index, 2], # 推進波の終点
+                                    self.highlow_since_new_arrow[1]          # 調整波の終点
                                 )
-                                highlow = detect_extension_reversal(prices_data_to_get_take_profit, higher1_percent=0.9)
-                                self.take_profit = highlow[2]
+                                self.take_profit = detect_extension_reversal(prices_data_to_get_take_profit, self.tp_level, self.up_trend)
                                 self.entry_line = neck_price + 0.006
                                 self.entry_index = global_index
                                 self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
@@ -199,12 +199,10 @@ class MyModel(object):
                                 self.sml_stop_loss = self.sml_pivots_after_goldencross[-1][2] + 0.006
                                 self.final_neckline_index = neckline[1]
                                 prices_data_to_get_take_profit = (
-                                    #self.full_data[self.start_index, 2],
-                                    self.full_data[self.new_arrow_index,3],
-                                    self.highlow_since_new_arrow[0]
+                                    self.full_data[self.new_arrow_index, 3], # 推進波の終点
+                                    self.highlow_since_new_arrow[0]          # 調整波の終点
                                 )
-                                highlow = detect_extension_reversal(prices_data_to_get_take_profit, lower1_percent=-0.9)
-                                self.take_profit = highlow[0]
+                                self.take_profit = detect_extension_reversal(prices_data_to_get_take_profit, self.tp_level, self.up_trend)
                                 self.entry_line = neck_price - 0.006
                                 self.entry_index = global_index
                                 self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
@@ -245,10 +243,10 @@ class MyModel(object):
         self.state_times[state_name] = self.new_arrow_index
         if self.up_trend:
             prices = (self.full_data[self.start_index, 3], self.full_data[self.new_arrow_index, 2])
-            self.base_fibo70, _, self.base_fibo37, _ = detect_extension_reversal(prices, lower1_percent=0.3, higher1_percent=-0.37)
+            self.base_fibo70, _, self.base_fibo37, _ = calculate_fibo_levels(prices, lower1_percent=0.3, higher1_percent=-0.37)
         else:
             prices = (self.full_data[self.start_index, 2], self.full_data[self.new_arrow_index, 3])
-            self.base_fibo37, _, self.base_fibo70, _ = detect_extension_reversal(prices, lower1_percent=0.37, higher1_percent=-0.3)
+            self.base_fibo37, _, self.base_fibo70, _ = calculate_fibo_levels(prices, lower1_percent=0.37, higher1_percent=-0.3)
         if self.base_fibo37 is None or self.base_fibo70 is None:
             self.destroy_reqest = True
             return
@@ -281,12 +279,17 @@ class MyModel(object):
 
     def on_enter_has_position(self):
         self.entry_time = self.full_data[self.entry_index, 0]
+        entry_time_dt = pd.to_datetime(self.entry_time, unit='ns', utc=True)
+        # if entry_time_dt == pd.Timestamp("2025-01-28 01:53:00+00:00"):
+        # print(f"DEBUG: Entry at {entry_time_dt}, Stoploss: {self.highlow_stop_loss}")
         self.global_entry_index = self.original_offset + self.entry_index
         self.set_state("closed")
 
     def on_enter_closed(self):
-        # self.trade_log = self.calculate_trade_result_fibo()
-        self.trade_log = self.calculate_trade_result_sml()
+        if self.stop_strategy == "fibo":
+            self.trade_log = self.calculate_trade_result_fibo()
+        else: # デフォルトはsml
+            self.trade_log = self.calculate_trade_result_sml()
         self.destroy_reqest = True
 
     def __repr__(self):
@@ -354,7 +357,7 @@ class MyModel(object):
                     if sml_pvts[i, 3] == 1 and sml_pvts[i, 1] > self.index_of_fibo37:
                         if i + 1 < sml_pvts.shape[0]:
                             prices = (sml_pvts[i-1, 2], sml_pvts[i, 2])
-                            fibo32_of_ptl_neck = detect_extension_reversal(prices, -0.32, 0.32, None, None)
+                            fibo32_of_ptl_neck = calculate_fibo_levels(prices, -0.32, 0.32, None, None)
                             if self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], sml_pvts[i+1, 3]):
                                 determined_neck = sml_pvts[i]
                         else:
@@ -363,7 +366,7 @@ class MyModel(object):
                     if sml_pvts[i, 3] == 0 and sml_pvts[i, 2] > self.index_of_fibo37:
                         if i + 1 < sml_pvts.shape[0]:
                             prices = (sml_pvts[i-1, 2], sml_pvts[i, 2])
-                            fibo32_of_ptl_neck = detect_extension_reversal(prices, None, None, 0.32, -0.32)
+                            fibo32_of_ptl_neck = calculate_fibo_levels(prices, None, None, 0.32, -0.32)
                             if self.watch_price_in_range(fibo32_of_ptl_neck[2], fibo32_of_ptl_neck[3], sml_pvts[i+1, 2]):
                                 determined_neck = sml_pvts[i]
                         else:
@@ -386,7 +389,7 @@ class MyModel(object):
             ]
             if self.up_trend:
                 judged_price = sml_pvts[-1][2]
-                fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level, -0.32, 0.32, None, None)
+                fibo32_of_ptl_neck = calculate_fibo_levels(pvts_to_get_32level, -0.32, 0.32, None, None)
                 result = self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], judged_price)
                 if result:
                     self.determined_neck.append(self.potential_neck[-1])
@@ -396,7 +399,7 @@ class MyModel(object):
                     self.potential_neck.clear()
             else:
                 judged_price = sml_pvts[-1][2]
-                fibo32_of_ptl_neck = detect_extension_reversal(pvts_to_get_32level, None, None, -0.32, 0.32)
+                fibo32_of_ptl_neck = calculate_fibo_levels(pvts_to_get_32level, None, None, -0.32, 0.32)
                 result = self.watch_price_in_range(fibo32_of_ptl_neck[2], fibo32_of_ptl_neck[3], judged_price)
                 if result:
                     self.determined_neck.append(self.potential_neck[-1])
@@ -441,7 +444,7 @@ class MyModel(object):
                 if sml_pvts.shape[0] < 2:
                     return None
                 sml_index_to_get32 = (neck_price, sml_pvts[-2][2])
-                fibo32_of_ptl_neck = detect_extension_reversal(sml_index_to_get32, -0.382, 0.382, None, None)
+                fibo32_of_ptl_neck = calculate_fibo_levels(sml_index_to_get32, -0.382, 0.382, None, None)
                 last_highlow = self.get_high_and_low_in_term(self.potential_neck[-1][0], global_index)
                 if self.watch_price_in_range(fibo32_of_ptl_neck[0], fibo32_of_ptl_neck[1], last_highlow[1]):
                     # エントリーラインおよびストップロス／テイクプロフィットの計算
@@ -450,12 +453,10 @@ class MyModel(object):
                     self.sml_stop_loss = last_highlow[1] - 0.006
                     self.final_neckline_index = self.potential_neck[-1][1]
                     prices_data_to_get_take_profit = (
-                        # self.full_data[self.start_index, 3],
-                        self.full_data[self.new_arrow_index, 2],
-                        self.highlow_since_new_arrow[1]
+                        self.full_data[self.new_arrow_index, 2], # 推進波の終点
+                        self.highlow_since_new_arrow[1]          # 調整波の終点
                     )
-                    highlow = detect_extension_reversal(prices_data_to_get_take_profit, higher1_percent=0.1)
-                    self.take_profit = highlow[2]
+                    self.take_profit = detect_extension_reversal(prices_data_to_get_take_profit, self.tp_level, self.up_trend)
                     self.entry_line = neck_price + 0.006
                     self.entry_index = global_index
                     self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
@@ -475,7 +476,7 @@ class MyModel(object):
                 if sml_pvts.shape[0] < 2:
                     return None
                 sml_index_to_get32 = (neck_price, sml_pvts[-2][2])
-                fibo32_of_ptl_neck = detect_extension_reversal(sml_index_to_get32, None, None, -0.382, 0.382)
+                fibo32_of_ptl_neck = calculate_fibo_levels(sml_index_to_get32, None, None, -0.382, 0.382)
                 last_highlow = self.get_high_and_low_in_term(self.potential_neck[-1][0], global_index)
                 if self.watch_price_in_range(fibo32_of_ptl_neck[2], fibo32_of_ptl_neck[3], last_highlow[0]):
                     self.highlow_since_new_arrow = self.get_high_and_low_in_term(self.index_of_fibo37, global_index + 1)
@@ -483,12 +484,10 @@ class MyModel(object):
                     self.sml_stop_loss = last_highlow[0] + 0.006
                     self.final_neckline_index = self.potential_neck[-1][1]
                     prices_data_to_get_take_profit = (
-                        #self.full_data[self.start_index, 2],
-                        self.full_data[self.new_arrow_index, 3],
-                        self.highlow_since_new_arrow[0]
+                        self.full_data[self.new_arrow_index, 3], # 推進波の終点
+                        self.highlow_since_new_arrow[0]          # 調整波の終点
                     )
-                    highlow = detect_extension_reversal(prices_data_to_get_take_profit, lower1_percent=-0.1)
-                    self.take_profit = highlow[0]
+                    self.take_profit = detect_extension_reversal(prices_data_to_get_take_profit, self.tp_level, self.up_trend)
                     self.entry_line = neck_price - 0.006
                     self.entry_index = global_index
                     self.point_to_stoploss = abs(self.entry_line - self.highlow_stop_loss)
@@ -520,145 +519,286 @@ class MyModel(object):
                 exit_time = self.entry_time
             exit_reason = "forced close"
             result = "forced"
+            profit_loss = 0
         else:
             highs = data_slice[:, 2]
             lows = data_slice[:, 3]
 
             if self.up_trend:
-                # 上昇トレンドの場合
-                tp_hit = highs >= self.take_profit
-                sl_hit = lows <= self.highlow_stop_loss
+                tp_hit_indices = np.where(highs >= self.take_profit)[0]
+                sl_hit_indices = np.where(lows <= self.highlow_stop_loss)[0]
             else:
-                # 下降トレンドの場合
-                tp_hit = lows <= self.take_profit
-                sl_hit = highs >= self.highlow_stop_loss
+                tp_hit_indices = np.where(lows <= self.take_profit)[0]
+                sl_hit_indices = np.where(highs >= self.highlow_stop_loss)[0]
 
-            tp_index = np.argmax(tp_hit) if np.any(tp_hit) else np.inf
-            sl_index = np.argmax(sl_hit) if np.any(sl_hit) else np.inf
+            tp_index = tp_hit_indices[0] if tp_hit_indices.size > 0 else np.inf
+            sl_index = sl_hit_indices[0] if sl_hit_indices.size > 0 else np.inf
 
-            # 最初に発生したイベントのインデックスを求める
-            first_event_index = min(tp_index, sl_index)
-
-            if first_event_index == np.inf:
-                # どちらの条件も満たさなかった場合は最終バーで強制決済
-                exit_index = len(data_slice) - 1
-                exit_price = data_slice[exit_index, 4]
-                exit_reason = "forced close"
-                result = "forced"
-            elif first_event_index == tp_index:
-                # テイクプロフィットが先にヒットした場合
+            # 同時ヒットの判定
+            if tp_index != np.inf and tp_index == sl_index:
+                # 同じ足で両方にヒットした場合
+                exit_index = tp_index
+                exit_price = (self.take_profit + self.highlow_stop_loss) / 2
+                exit_reason = "SL/TP simultaneous hit"
+                result = "breakeven"
+            elif tp_index < sl_index:
+                # 利確が先にヒットした場合
                 exit_index = tp_index
                 exit_price = self.take_profit
                 exit_reason = "T/P"
                 result = "win"
-            else:
-                # ストップロスが先にヒットした場合（highlow_stop_lossのみをチェック）
+            elif sl_index < tp_index:
+                # 損切りが先にヒットした場合
                 exit_index = sl_index
                 exit_price = self.highlow_stop_loss
                 exit_reason = "S/L (highlow)"
                 result = "loss"
+            else:
+                # どちらもヒットしなかった場合
+                exit_index = len(data_slice) - 1
+                exit_price = data_slice[exit_index, 4]
+                exit_reason = "forced close"
+                result = "forced"
 
             exit_time = data_slice[exit_index, 0]
+            profit_loss = (exit_price - self.entry_line if self.up_trend 
+                        else self.entry_line - exit_price)
 
-        profit_loss = (exit_price - self.entry_line if self.up_trend 
-                    else self.entry_line - exit_price)
-
-        trade_log = {
-            "entry_time": pd.to_datetime(self.entry_time, unit="ns", utc=True),
-            "up_trend" : self.up_trend,
-            "exit_time": pd.to_datetime(exit_time, unit="ns", utc=True),
-            "result": result,
-            "entry_price": self.entry_line,
-            "exit_price": exit_price,
-            "take_profit": self.take_profit,
-            "highlow_stop_loss": self.highlow_stop_loss,
-            # sml_stop_loss は今回使用しないため省略
-            "exit_reason": exit_reason,
-            "profit_loss": profit_loss,
-            "risk_reward_ratio": self.point_to_take_profit / self.point_to_stoploss
-        }
-
-        return trade_log
+        return self.format_trade_log(exit_time, result, exit_price, exit_reason, profit_loss)
     
+    # def calculate_trade_result_sml(self):
+    #     """
+    #     高速なトレード結果判定（SMLピボットベースの決済）
+    #     ・エントリー後から最初のSMLピボットまでの区間をチェックし、SL条件があれば決済
+    #     ・その後、各ピボット間の区間で、前のピボットの安値がブレイクされたかをチェック
+    #     ・最終ピボット以降もチェックし、どれもヒットしなければ最終バーで強制決済
+    #     """
+    #     # SMLピボット（安値ピボット）のインデックスを取得
+    #     pivot_indices = self.get_pivots_in_range(self.entry_index, len(self.full_data)-1, base_or_sml="sml")
+    #     # typeが0.0（安値ピボット）のものだけを残す
+    #     pivot_indices = [idx for idx in pivot_indices if self.full_data[idx, 14] == 0.0]
+
+    #     current_sl = self.highlow_stop_loss
+    #     entry_price = self.entry_line
+    #     exit_price, exit_time, exit_reason, result = None, None, None, None
+
+    #     # ①エントリー後から最初のピボットまでのスライスをチェック
+    #     if pivot_indices:
+    #         first_pivot = pivot_indices[0]
+    #         slice_data = self.full_data[self.entry_index:first_pivot, 3]  # 3: low列
+    #         if np.any(slice_data <= current_sl):
+    #             exit_price = current_sl
+    #             exit_time = self.full_data[self.entry_index + np.argmax(slice_data <= current_sl), 0]
+    #             exit_reason, result = "S/L", "loss"
+    #         else:
+    #             # ②2番目以降のピボットについてチェックする
+    #             for i in range(len(pivot_indices) - 1):
+    #                 current_pivot_idx = pivot_indices[i]
+    #                 next_pivot_idx = pivot_indices[i + 1]
+    #                 current_pivot_price = self.full_data[current_pivot_idx, 13]  # 13: pivot price
+    #                 # 現在のピボットと次のピボットの間のlow値を確認
+    #                 slice_lows = self.full_data[current_pivot_idx:next_pivot_idx, 3]
+    #                 if np.any(slice_lows <= current_pivot_price):
+    #                     exit_price = current_pivot_price
+    #                     exit_time = self.full_data[current_pivot_idx + np.argmax(slice_lows <= current_pivot_price), 0]
+    #                     exit_reason = "SML pivot break"
+    #                     # エントリー価格より高ければwin、そうでなければ微損
+    #                     result = "win" if exit_price > entry_price else "微損"
+    #                     break
+    #             else:
+    #                 # ③最後のピボット以降〜最終バーまでチェック
+    #                 last_pivot_idx = pivot_indices[-1]
+    #                 last_pivot_price = self.full_data[last_pivot_idx, 13]
+    #                 slice_lows = self.full_data[last_pivot_idx:, 3]
+    #                 if np.any(slice_lows <= last_pivot_price):
+    #                     exit_price = last_pivot_price
+    #                     exit_time = self.full_data[last_pivot_idx + np.argmax(slice_lows <= last_pivot_price), 0]
+    #                     exit_reason = "SML pivot break"
+    #                     result = "win" if exit_price > entry_price else "微損"
+    #                 else:
+    #                     # どの条件もヒットしなければ、最終バーで強制決済
+    #                     exit_price = self.full_data[-1, 4]  # 4: close列
+    #                     exit_time = self.full_data[-1, 0]
+    #                     exit_reason, result = "forced close", "forced"
+    #     else:
+    #         # SMLピボットが全くなかった場合はエントリー後から最後までチェック
+    #         slice_data = self.full_data[self.entry_index:, 3]
+    #         if np.any(slice_data <= current_sl):
+    #             exit_price = current_sl
+    #             exit_time = self.full_data[self.entry_index + np.argmax(slice_data <= current_sl), 0]
+    #             exit_reason, result = "S/L", "loss"
+    #         else:
+    #             exit_price = self.full_data[-1, 4]
+    #             exit_time = self.full_data[-1, 0]
+    #             exit_reason, result = "forced close", "forced"
+
+    #     profit_loss = (exit_price - entry_price) if self.up_trend else (entry_price - exit_price)
+    #     trade_log = {
+    #         "entry_time": pd.to_datetime(self.entry_time, unit="ns", utc=True),
+    #         "up_trend": self.up_trend,
+    #         "exit_time": pd.to_datetime(exit_time, unit="ns", utc=True),
+    #         "result": result,
+    #         "entry_price": entry_price,
+    #         "exit_price": exit_price,
+    #         "exit_reason": exit_reason,
+    #         "profit_loss": profit_loss,
+    #         "risk_reward_ratio": self.point_to_take_profit / self.point_to_stoploss
+    #     }
+    #     return trade_log
+
     def calculate_trade_result_sml(self):
         """
-        高速なトレード結果判定（SMLピボットベースの決済）
-        ・エントリー後から最初のSMLピボットまでの区間をチェックし、SL条件があれば決済
-        ・その後、各ピボット間の区間で、前のピボットの安値がブレイクされたかをチェック
-        ・最終ピボット以降もチェックし、どれもヒットしなければ最終バーで強制決済
+        新しい決済ロジック（ネックライン割れ決済とトレーリング利確）
+        ルール1：初期損切り
+        ルール2：最初のネックライン割れでの決済（微損 or 微益）
+        ルール3：2つ目以降のネックラインを使ったトレーリング利確
         """
-        # SMLピボット（安値ピボット）のインデックスを取得
-        pivot_indices = self.get_pivots_in_range(self.entry_index, len(self.full_data)-1, base_or_sml="sml")
-        # typeが0.0（安値ピボット）のものだけを残す
-        pivot_indices = [idx for idx in pivot_indices if self.full_data[idx, 14] == 0.0]
-
-        current_sl = self.highlow_stop_loss
         entry_price = self.entry_line
-        exit_price, exit_time, exit_reason, result = None, None, None, None
+        initial_sl = self.highlow_stop_loss
+        take_profit = self.take_profit # 利確ラインも考慮に入れる
 
-        # ①エントリー後から最初のピボットまでのスライスをチェック
-        if pivot_indices:
-            first_pivot = pivot_indices[0]
-            slice_data = self.full_data[self.entry_index:first_pivot, 3]  # 3: low列
-            if np.any(slice_data <= current_sl):
-                exit_price = current_sl
-                exit_time = self.full_data[self.entry_index + np.argmax(slice_data <= current_sl), 0]
-                exit_reason, result = "S/L", "loss"
-            else:
-                # ②2番目以降のピボットについてチェックする
-                for i in range(len(pivot_indices) - 1):
-                    current_pivot_idx = pivot_indices[i]
-                    next_pivot_idx = pivot_indices[i + 1]
-                    current_pivot_price = self.full_data[current_pivot_idx, 13]  # 13: pivot price
-                    # 現在のピボットと次のピボットの間のlow値を確認
-                    slice_lows = self.full_data[current_pivot_idx:next_pivot_idx, 3]
-                    if np.any(slice_lows <= current_pivot_price):
-                        exit_price = current_pivot_price
-                        exit_time = self.full_data[current_pivot_idx + np.argmax(slice_lows <= current_pivot_price), 0]
-                        exit_reason = "SML pivot break"
-                        # エントリー価格より高ければwin、そうでなければ微損
-                        result = "win" if exit_price > entry_price else "微損"
-                        break
-                else:
-                    # ③最後のピボット以降〜最終バーまでチェック
-                    last_pivot_idx = pivot_indices[-1]
-                    last_pivot_price = self.full_data[last_pivot_idx, 13]
-                    slice_lows = self.full_data[last_pivot_idx:, 3]
-                    if np.any(slice_lows <= last_pivot_price):
-                        exit_price = last_pivot_price
-                        exit_time = self.full_data[last_pivot_idx + np.argmax(slice_lows <= last_pivot_price), 0]
-                        exit_reason = "SML pivot break"
-                        result = "win" if exit_price > entry_price else "微損"
-                    else:
-                        # どの条件もヒットしなければ、最終バーで強制決済
-                        exit_price = self.full_data[-1, 4]  # 4: close列
-                        exit_time = self.full_data[-1, 0]
-                        exit_reason, result = "forced close", "forced"
-        else:
-            # SMLピボットが全くなかった場合はエントリー後から最後までチェック
-            slice_data = self.full_data[self.entry_index:, 3]
-            if np.any(slice_data <= current_sl):
-                exit_price = current_sl
-                exit_time = self.full_data[self.entry_index + np.argmax(slice_data <= current_sl), 0]
-                exit_reason, result = "S/L", "loss"
-            else:
-                exit_price = self.full_data[-1, 4]
-                exit_time = self.full_data[-1, 0]
-                exit_reason, result = "forced close", "forced"
+        # トレンドに応じて高値/安値、ピボットタイプ、比較演算子を切り替える
+        if self.up_trend:
+            price_col, opposite_price_col = 3, 2 # low, high
+            pvt_type = 0.0 # 安値ピボット
+            is_sl_hit = lambda price, sl: price <= sl
+            is_tp_hit = lambda price, tp: price >= tp
+            is_neck_break = lambda price, neck: price <= neck
+        else: # Down Trend
+            price_col, opposite_price_col = 2, 3 # high, low
+            pvt_type = 1.0 # 高値ピボット
+            is_sl_hit = lambda price, sl: price >= sl
+            is_tp_hit = lambda price, tp: price <= tp
+            is_neck_break = lambda price, neck: price >= neck
 
+        # エントリー後のSMLピボット（＝ネックライン候補）を取得
+        all_pivots = self.get_pivots_in_range(self.entry_index, len(self.full_data) - 1, base_or_sml="sml")
+        neckline_pivots_indices = [idx for idx in all_pivots if self.full_data[idx, 14] == pvt_type]
+
+        # --- ルール1 & 2：最初のネックラインが形成されるまでの処理 ---
+        first_neck_idx = neckline_pivots_indices[0] if neckline_pivots_indices else len(self.full_data) -1
+
+        # エントリーから最初のネックラインまでの価格データを取得
+        data_before_first_neck = self.full_data[self.entry_index : first_neck_idx + 1]
+
+        # 初期損切りラインにヒットしたかチェック
+        sl_hits = np.where(is_sl_hit(data_before_first_neck[:, price_col], initial_sl))[0]
+        if sl_hits.size > 0:
+            # ルール1：完全な負け
+            exit_idx = self.entry_index + sl_hits[0]
+            exit_price = initial_sl
+            exit_time = self.full_data[exit_idx, 0]
+            exit_reason, result = "S/L (Initial)", "loss"
+            profit_loss = (exit_price - entry_price) if self.up_trend else (entry_price - exit_price)
+            return self.format_trade_log(exit_time, result, exit_price, exit_reason, profit_loss)
+
+        # 利確ラインにヒットしたかチェック
+        tp_hits = np.where(is_tp_hit(data_before_first_neck[:, opposite_price_col], take_profit))[0]
+        if tp_hits.size > 0:
+            exit_idx = self.entry_index + tp_hits[0]
+            exit_price = take_profit
+            exit_time = self.full_data[exit_idx, 0]
+            exit_reason, result = "T/P", "win"
+            profit_loss = (exit_price - entry_price) if self.up_trend else (entry_price - exit_price)
+            return self.format_trade_log(exit_time, result, exit_price, exit_reason, profit_loss)
+
+        # ネックラインが一つも形成されずに終了した場合
+        if not neckline_pivots_indices:
+            exit_idx = len(self.full_data) - 1
+            exit_price = self.full_data[exit_idx, 4] # close
+            exit_time = self.full_data[exit_idx, 0]
+            exit_reason, result = "Forced Close", "forced"
+            profit_loss = (exit_price - entry_price) if self.up_trend else (entry_price - exit_price)
+            return self.format_trade_log(exit_time, result, exit_price, exit_reason, profit_loss)
+
+        # --- ルール3：2つ目以降のネックラインを使ったトレーリング利確 ---
+        # ここに来た時点で、最初のネックラインは割れていないことが確定している
+        # 負けはないので、ここからは利確モード
+        
+        # 最初のネックラインを初期のトレーリングストップラインとする
+        trailing_sl_price = self.full_data[first_neck_idx, 13]
+
+        # 2つ目以降のネックラインをループ処理
+        for i in range(len(neckline_pivots_indices) - 1):
+            current_neck_idx = neckline_pivots_indices[i]
+            next_neck_idx = neckline_pivots_indices[i+1]
+            
+            # 現在のネックラインから次のネックラインまでの価格データを取得
+            data_between_necks = self.full_data[current_neck_idx : next_neck_idx + 1]
+
+            # トレーリングストップにヒットしたかチェック
+            break_hits = np.where(is_neck_break(data_between_necks[:, price_col], trailing_sl_price))[0]
+            if break_hits.size > 0:
+                exit_idx = current_neck_idx + break_hits[0]
+                exit_price = trailing_sl_price
+                exit_time = self.full_data[exit_idx, 0]
+                exit_reason = "Trailing SL"
+                # この時点で決済価格がエントリー価格を上回っていれば勝ち、そうでなければ微損
+                result = "win" if (self.up_trend and exit_price > entry_price) or \
+                                  (not self.up_trend and exit_price < entry_price) else "微損"
+                profit_loss = (exit_price - entry_price) if self.up_trend else (entry_price - exit_price)
+                return self.format_trade_log(exit_time, result, exit_price, exit_reason, profit_loss)
+
+            # 利確ラインにヒットしたかチェック
+            tp_hits_trailing = np.where(is_tp_hit(data_between_necks[:, opposite_price_col], take_profit))[0]
+            if tp_hits_trailing.size > 0:
+                exit_idx = current_neck_idx + tp_hits_trailing[0]
+                exit_price = take_profit
+                exit_time = self.full_data[exit_idx, 0]
+                exit_reason, result = "T/P", "win"
+                profit_loss = (exit_price - entry_price) if self.up_trend else (entry_price - exit_price)
+                return self.format_trade_log(exit_time, result, exit_price, exit_reason, profit_loss)
+
+            # 次のループのためにトレーリングストップラインを更新
+            trailing_sl_price = self.full_data[next_neck_idx, 13]
+
+        # --- ループ終了後：最後のネックラインを基準に最後までチェック ---
+        last_neck_idx = neckline_pivots_indices[-1]
+        data_after_last_neck = self.full_data[last_neck_idx:]
+
+        # 最後のトレーリングストップにヒットしたか
+        final_break_hits = np.where(is_neck_break(data_after_last_neck[:, price_col], trailing_sl_price))[0]
+        if final_break_hits.size > 0:
+            exit_idx = last_neck_idx + final_break_hits[0]
+            exit_price = trailing_sl_price
+            exit_time = self.full_data[exit_idx, 0]
+            exit_reason = "Trailing SL"
+            result = "win" if (self.up_trend and exit_price > entry_price) or \
+                              (not self.up_trend and exit_price < entry_price) else "微損"
+            profit_loss = (exit_price - entry_price) if self.up_trend else (entry_price - exit_price)
+            return self.format_trade_log(exit_time, result, exit_price, exit_reason, profit_loss)
+
+        # 最後の利確ラインにヒットしたか
+        final_tp_hits = np.where(is_tp_hit(data_after_last_neck[:, opposite_price_col], take_profit))[0]
+        if final_tp_hits.size > 0:
+            exit_idx = last_neck_idx + final_tp_hits[0]
+            exit_price = take_profit
+            exit_time = self.full_data[exit_idx, 0]
+            exit_reason, result = "T/P", "win"
+            profit_loss = (exit_price - entry_price) if self.up_trend else (entry_price - exit_price)
+            return self.format_trade_log(exit_time, result, exit_price, exit_reason, profit_loss)
+
+        # それでも決済されなければ、最終バーで強制決済
+        exit_idx = len(self.full_data) - 1
+        exit_price = self.full_data[exit_idx, 4] # close
+        exit_time = self.full_data[exit_idx, 0]
+        exit_reason, result = "Forced Close", "forced"
         profit_loss = (exit_price - entry_price) if self.up_trend else (entry_price - exit_price)
-        trade_log = {
+        return self.format_trade_log(exit_time, result, exit_price, exit_reason, profit_loss)
+
+    def format_trade_log(self, exit_time, result, exit_price, exit_reason, profit_loss):
+        """トレードログを整形して返すヘルパー関数"""
+        return {
             "entry_time": pd.to_datetime(self.entry_time, unit="ns", utc=True),
             "up_trend": self.up_trend,
             "exit_time": pd.to_datetime(exit_time, unit="ns", utc=True),
             "result": result,
-            "entry_price": entry_price,
+            "entry_price": self.entry_line,
             "exit_price": exit_price,
             "exit_reason": exit_reason,
             "profit_loss": profit_loss,
-            "risk_reward_ratio": self.point_to_take_profit / self.point_to_stoploss
+            "risk_reward_ratio": self.point_to_take_profit / self.point_to_stoploss if self.point_to_stoploss > 0 else np.inf
         }
-        return trade_log
 
 
 
@@ -757,7 +897,7 @@ class MyModel(object):
         high_val = max(low, high)
         return True if low_val <= judged_price <= high_val else False
     
-def detect_extension_reversal(prices, lower1_percent=None, lower2_percent=None, higher1_percent=None, higher2_percent=None):
+def calculate_fibo_levels(prices, lower1_percent=None, lower2_percent=None, higher1_percent=None, higher2_percent=None):
     price1 = prices[0]
     price2 = prices[1]
     low_val = min(price1, price2)
@@ -768,6 +908,26 @@ def detect_extension_reversal(prices, lower1_percent=None, lower2_percent=None, 
     low2 = low_val - (-wave_range * lower2_percent) if lower2_percent is not None else None
     high2 = high_val - (-wave_range * higher2_percent) if higher2_percent is not None else None
     return (low1, low2, high1, high2)
+
+def detect_extension_reversal(prices, extension_level, is_up_trend):
+    """
+    調整波の価格情報とextension_levelから、テイクプロフィット価格を計算する。
+    :param prices: (推進波の終点価格, 調整波の終点価格) のタプル
+    :param extension_level: 拡張レベル (例: 1.38)
+    :param is_up_trend: トレンド方向
+    :return: take_profit_price
+    """
+    wave_end_price, adjustment_end_price = prices
+    adjustment_wave_length = abs(wave_end_price - adjustment_end_price)
+    
+    if is_up_trend:
+        # 上昇トレンドの場合：調整波の安値 + (調整波の長さ * レベル)
+        take_profit_price = adjustment_end_price + (adjustment_wave_length * extension_level)
+    else:
+        # 下降トレンドの場合：調整波の高値 - (調整波の長さ * レベル)
+        take_profit_price = adjustment_end_price - (adjustment_wave_length * extension_level)
+        
+    return take_profit_price
 
 def check_touch_line(center_price, tested_price):
     if center_price <= tested_price:

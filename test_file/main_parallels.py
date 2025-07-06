@@ -13,8 +13,6 @@ def split_periods(start_date, end_date, overlap=2000, splits=8):
     for i in range(splits):
         split_start = start_date + timedelta(days=i * days_per_split)
         split_end = split_start + timedelta(days=days_per_split)
-        print(f"スタート{split_start}")
-        print(f"エンド{split_end}")
         if i != 0:
             split_start -= timedelta(minutes=overlap)
         if i != splits - 1:
@@ -25,10 +23,10 @@ def split_periods(start_date, end_date, overlap=2000, splits=8):
 
 def main_parallel():
     symbol = "USDJPY"
-    start_date = datetime(2025, 1, 14, tzinfo=pytz.UTC)
-    end_date = datetime(2025, 1, 20, tzinfo=pytz.UTC)
+    start_date = datetime(2014, 12, 14, tzinfo=pytz.UTC)
+    end_date = datetime(2025, 2, 20, tzinfo=pytz.UTC)
 
-    periods = split_periods(start_date, end_date, overlap=2000, splits=1)
+    periods = split_periods(start_date, end_date, overlap=2000, splits=8)
     conditions_list = [{
         "symbol": symbol,
         "fromdate": period[0],
@@ -44,7 +42,7 @@ def main_parallel():
         "SML_consecutive": 1,
         "SML_arrow_spacing": 2,
         "range": 80,
-        "stop": "sml",
+        "stop": "fibo",
         "tp_level": 138,
         "check_no_sma": True,
         "risk_percentage": 5.0,
@@ -70,7 +68,7 @@ def main_parallel():
     wm_final = WaveManager()
     wm_final.trade_logs = combined_trade_logs
     wm_final.summarize_and_export_results(
-        filename="final_combined_trade_logs.csv",
+        filename="test_file/test_result/final_combined_trade_logs.csv",
         initial_capital=10000,
         risk_percentage=conditions_list[0]["risk_percentage"]
     )
